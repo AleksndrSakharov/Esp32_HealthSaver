@@ -174,6 +174,25 @@ void setup() {
 
 
 void loop() {
+  // Проверка команд из Serial
+  if (Serial.available() > 0) {
+    String command = Serial.readStringUntil('\n');
+    command.trim();
+    if (command == "READ_SD") {
+      Serial.println("---START_FILE---");
+      File file = SD.open("/received_data.txt");
+      if (file) {
+        while (file.available()) {
+          Serial.write(file.read());
+        }
+        file.close();
+      } else {
+        Serial.println("ERROR: Could not open file");
+      }
+      Serial.println("\n---END_FILE---");
+    }
+  }
+
   if (doConnect == true) {
     if (connectToServer()) {
       Serial.println("We are now connected to the BLE Server.");
