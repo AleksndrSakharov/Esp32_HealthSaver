@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>HealthSaver Console</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;600;700&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/styles.css" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+<body>
+  <div class="bg"></div>
+  <header class="topbar">
+    <div>
+      <h1>HealthSaver Console</h1>
+      <p>Remote hub data, live streams, and history</p>
+    </div>
+    <div class="status" id="ws-status">WS: disconnected</div>
+  </header>
+
+  <main class="layout">
+    <section class="panel list-panel">
+      <div class="panel-title">Measurements</div>
+      <div class="filters">
+        <input id="filter-device" placeholder="Filter by device" />
+        <input id="filter-sensor" placeholder="Filter by sensor" />
+        <button id="refresh">Refresh</button>
+      </div>
+      <div id="measurement-list" class="list"></div>
+    </section>
+
+    <section class="panel detail-panel">
+      <div class="panel-title">Details</div>
+      <div id="detail" class="detail">
+        <div>Select a measurement to view details.</div>
+      </div>
+      <div class="chart-wrap">
+        <canvas id="chart"></canvas>
+      </div>
+    </section>
+  </main>
+
+  <script src="/app.js"></script>
+</body>
+</html>

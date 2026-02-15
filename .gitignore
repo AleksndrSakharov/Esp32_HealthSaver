@@ -1,0 +1,34 @@
+# Build outputs
+**/bin/
+**/obj/
+**/build/
+**/dist/
+
+# .NET
+**/*.user
+**/*.suo
+**/*.userosscache
+**/*.sln.docstates
+
+# VS/VS Code
+.vs/
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+**/*.log
+
+# Python
+**/__pycache__/
+**/*.pyc
+.venv/
+
+# Node
+**/node_modules/
+
+# Data outputs
+**/Data/
+**/excel/
