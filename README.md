@@ -10,3 +10,11 @@ This workspace now includes a full implementation for phases 0-5:
 - Phase 5: Web console (SPA).
 
 See [docs/run.md](docs/run.md) for instructions.
+
+## Быстрые переходы к веткам устройств
+
+GitHub не умеет автоматически показывать содержимое других веток при клике по папке в `main`.
+Вместо этого используйте прямые ссылки на нужные ветки:
+
+- [HUB/Esp32_HealthSaver/Esp32_hub](../../tree/Esp32_hub/HUB/Esp32_HealthSaver/Esp32_hub)
+- [blood pressure monitor/Esp32_HealthSaver/blood_pressure_monitor](../../tree/Esp32_blood_pressure_monitor/blood%20pressure%20monitor/Esp32_HealthSaver/blood_pressure_monitor)
