@@ -44,12 +44,3 @@ CREATE TABLE IF NOT EXISTS measurement_chunks (
     UNIQUE (measurement_id, chunk_index)
 );
 
--- Optional TimescaleDB table for downsampled points
--- CREATE EXTENSION IF NOT EXISTS timescaledb;
--- CREATE TABLE IF NOT EXISTS measurement_samples (
---     measurement_id UUID NOT NULL,
---     sample_index INT NOT NULL,
---     value REAL NOT NULL,
---     recorded_utc TIMESTAMPTZ NOT NULL DEFAULT NOW()
--- );
--- SELECT create_hypertable('measurement_samples', 'recorded_utc', if_not_exists => TRUE);

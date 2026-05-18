@@ -1,20 +1,44 @@
-# ESP32 HealthSaver - Server Plan Implementation
+# HealthSaver
 
-This workspace now includes a full implementation for phases 0-5:
+HealthSaver is a monorepo for the ESP32 health monitoring system.
 
-- Phase 0: Data contract and schema (see docs).
-- Phase 1: Transport (HTTP + WebSocket) and serial bridge.
-- Phase 2: Ingestion service with chunking and dedupe.
-- Phase 3: Storage (PostgreSQL metadata + raw files).
-- Phase 4: Preprocessing hooks via downsampling for UI.
-- Phase 5: Web console (SPA).
+## Repository Layout
 
-See [docs/run.md](docs/run.md) for instructions.
+```text
+agent/
+  HealthSaver.Agent/              Legacy serial bridge
 
-## Быстрые переходы к веткам устройств
+docs/                             Data contract, run guide, reports
 
-GitHub не умеет автоматически показывать содержимое других веток при клике по папке в `main`.
-Вместо этого используйте прямые ссылки на нужные ветки:
+firmware/
+  blood-pressure-monitor/         ESP32 blood pressure sensor firmware
+  hub/                            ESP32 BLE-to-WiFi HTTP hub firmware
 
-- [HUB/Esp32_HealthSaver/Esp32_hub](../../tree/Esp32_hub/HUB/Esp32_HealthSaver/Esp32_hub)
-- [blood pressure monitor/Esp32_HealthSaver/blood_pressure_monitor](../../tree/Esp32_blood_pressure_monitor/blood%20pressure%20monitor/Esp32_HealthSaver/blood_pressure_monitor)
+server/
+  HealthSaver.Server/             ASP.NET Core API and web console
+  db/                             PostgreSQL initialization scripts
+
+.github/workflows/                Monorepo CI workflows
+HealthSaver.sln                   .NET solution for server and agent
+```
+
+## Current Data Flow
+
+```text
+ESP32 health sensor -> BLE -> ESP32 hub -> WiFi HTTP -> ASP.NET server -> Web/Mobile UI
+```
+
+The hub parses BLE measurements, assigns `deviceId`, `sensorType`, `unit`, and
+`sampleRateHz`, optionally stores an SD backup, and sends chunks to the ASP.NET
+ingestion API.
+
+## Branching
+
+Use branches for changes, not for separate components. For example:
+
+- `main` for stable code
+- `feature/add-ecg-sensor` for a new sensor
+- `feature/ai-recommendations` for AI recommendation work
+- `fix/hub-ble-reconnect` for a focused bug fix
+
+See [docs/run.md](docs/run.md) for local run instructions.

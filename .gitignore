@@ -3,6 +3,8 @@
 **/obj/
 **/build/
 **/dist/
+**/.pio/
+**/.sconsign*.dblite
 
 # .NET
 **/*.user
@@ -10,9 +12,10 @@
 **/*.userosscache
 **/*.sln.docstates
 
-# VS/VS Code
+# IDE
 .vs/
 .vscode/
+**/.vscode/
 
 # OS files
 .DS_Store
@@ -32,3 +35,11 @@ Thumbs.db
 # Data outputs
 **/Data/
 **/excel/
+
+# Firmware local secrets
+firmware/**/include/secrets.h
+
+# Firmware build artifacts
+**/*.bin
+**/*.elf
+**/*.map

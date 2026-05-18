@@ -1,6 +1,8 @@
 # HealthSaver.Agent
 
-Serial bridge that reads the hub SD output and pushes it to the ASP.NET server.
+Legacy serial bridge that reads the old hub SD output and pushes it to the ASP.NET server.
+
+The main pipeline now sends measurements directly from the ESP32 hub to ASP.NET over WiFi HTTP.
 
 ## Usage
 

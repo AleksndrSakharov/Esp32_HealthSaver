@@ -1,5 +1,27 @@
 # HealthSaver Data Contract (Phase 0)
 
+## BLE Protocol HS1
+
+```text
+H1S;p;mmHg;1;1
+H1D;0;120.55
+H1D;1;118.30
+H1E;2
+```
+
+Compact frames are used by default because ESP32 BLE notifications can be
+limited to 20 bytes when MTU negotiation is unavailable.
+
+```text
+HS1;START;type=pressure;unit=mmHg;rate=1;schema=1
+HS1;CHUNK;index=0;values=120.55,118.30,115.20
+HS1;END;sampleCount=3
+```
+
+The sensor sends metadata in `START`, one or more numeric chunks in `CHUNK`,
+and the final sample count in `END`. The ESP32 hub parses this protocol and
+maps it to the HTTP ingestion contract below.
+
 ## Measurement Start
 
 ```json
