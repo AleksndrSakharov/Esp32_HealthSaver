@@ -18,9 +18,22 @@ server/
   HealthSaver.Server/             ASP.NET Core API and web console
   db/                             PostgreSQL initialization scripts
 
-.github/workflows/                Monorepo CI workflows
 HealthSaver.sln                   .NET solution for server and agent
 ```
+
+## Prerequisites
+
+Install these tools on a clean Windows machine:
+
+- [.NET 8 SDK](https://dotnet.microsoft.com/en-US/download/dotnet/8.0) for the ASP.NET server.
+- [PostgreSQL for Windows](https://www.postgresql.org/download/windows/) for server metadata storage.
+- [PlatformIO IDE for VS Code](https://docs.platformio.org/en/latest/integration/ide/vscode.html) for ESP32 firmware build and upload.
+- [Git for Windows](https://git-scm.com/install/windows) if you clone the repository from Git.
+
+Install a USB-UART driver if the ESP32 board does not appear as a COM port:
+
+- [Silicon Labs CP210x driver](https://www.silabs.com/developer-tools/usb-to-uart-bridge-vcp-drivers)
+- [WCH CH340/CH341 driver](https://www.wch-ic.com/downloads/CH341SER_EXE.html)
 
 ## Current Data Flow
 
