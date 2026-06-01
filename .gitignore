@@ -1,6 +1,7 @@
 # Build outputs
 **/bin/
 **/obj/
+**/.tmpobj/
 **/build/
 **/dist/
 **/.pio/

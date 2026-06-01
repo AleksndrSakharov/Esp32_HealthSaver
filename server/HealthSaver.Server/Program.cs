@@ -3,6 +3,8 @@ using Microsoft.EntityFrameworkCore;
 
 var builder = WebApplication.CreateBuilder(args);
 
+builder.WebHost.UseUrls(builder.Configuration.GetValue<string>("Server:Urls") ?? "http://0.0.0.0:5000");
+
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();
 builder.Services.AddSwaggerGen();
@@ -14,9 +16,11 @@ builder.Services.AddCors(options =>
 
 builder.Services.Configure<StorageOptions>(builder.Configuration.GetSection("Storage"));
 builder.Services.Configure<IngestOptions>(builder.Configuration.GetSection("Ingest"));
+builder.Services.Configure<DiscoveryOptions>(builder.Configuration.GetSection("Discovery"));
 
 builder.Services.AddSingleton<RawStorageService>();
 builder.Services.AddSingleton<LiveHub>();
+builder.Services.AddHostedService<ServerDiscoveryBroadcaster>();
 
 builder.Services.AddDbContext<AppDbContext>(options =>
 {

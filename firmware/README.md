@@ -18,3 +18,7 @@ pio run
 ```
 
 Do not commit generated PlatformIO output from `.pio/`, local IDE settings, or real WiFi/server credentials.
+
+The hub stores WiFi credentials in ESP32 NVS after provisioning through the
+temporary `ESP32HUB` access point. `secrets.h` is only needed for optional
+compile-time values such as `HUB_ID`.

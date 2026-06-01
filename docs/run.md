@@ -22,14 +22,30 @@ dotnet restore
 dotnet run --urls http://0.0.0.0:5000
 ```
 
-## 3) Hub WiFi settings
+The server broadcasts its local URL over UDP port `50505`. The hub uses this
+announcement instead of a manually configured `SERVER_BASE_URL`.
+Keep the server bound to `0.0.0.0:5000`, otherwise the broadcast can be visible
+while the HTTP endpoint remains unavailable from ESP32. Windows Firewall must
+allow inbound TCP `5000`; UDP `50505` is used for discovery broadcast.
 
-Configure `WIFI_SSID`, `WIFI_PASSWORD`, `SERVER_BASE_URL`, and optionally
-`HUB_ID` in `firmware/hub/include/secrets.h` using
-`firmware/hub/include/secrets.example.h` as a template, or set them as
-PlatformIO build flags.
-`SERVER_BASE_URL` must point to the ASP.NET server from the ESP32 network, for
-example `http://192.168.1.50:5000`.
+## 3) Hub WiFi provisioning
+
+On first boot, or when WiFi credentials are missing, the hub starts a temporary
+access point:
+
+```text
+SSID: ESP32HUB
+Password: healthsaver
+URL: http://192.168.4.1
+```
+
+Connect to this WiFi from a phone or laptop and enter the target WiFi SSID and
+password. The hub stores credentials in ESP32 NVS, restarts, joins that WiFi,
+listens for ASP.NET server discovery broadcasts, and then uses the discovered
+URL for ingestion.
+
+`firmware/hub/include/secrets.h` is now only needed for optional compile-time
+settings such as `HUB_ID`.
 
 ## 4) UI
 
@@ -56,3 +72,7 @@ The normal runtime flow is:
 ```text
 BLE sensor -> ESP32 hub -> WiFi HTTP -> ASP.NET server -> Web/Mobile UI
 ```
+
+The hub keeps BLE and WiFi active at the same time after provisioning. BLE
+collects a complete measurement and queues it, while a separate network task
+maintains WiFi, listens for UDP discovery, and uploads queued measurements.

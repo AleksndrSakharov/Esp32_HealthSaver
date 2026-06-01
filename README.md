@@ -45,6 +45,12 @@ The hub parses BLE measurements, assigns `deviceId`, `sensorType`, `unit`, and
 `sampleRateHz`, optionally stores an SD backup, and sends chunks to the ASP.NET
 ingestion API.
 
+On first boot the hub starts a provisioning access point named `ESP32HUB`.
+After WiFi credentials are saved, the ASP.NET server is discovered automatically
+through UDP broadcast, so the hub no longer needs a hardcoded server URL.
+At runtime the hub keeps BLE collection and WiFi upload separated: completed
+measurements are queued by the BLE side and uploaded by a network task.
+
 ## Branching
 
 Use branches for changes, not for separate components. For example:

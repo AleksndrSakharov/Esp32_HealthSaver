@@ -1,44 +1,21 @@
 #include <Arduino.h>
+#include <AsyncTCP.h>
 #include <BLEAdvertisedDevice.h>
 #include <BLEDevice.h>
 #include <BLEScan.h>
 #include <BLEUtils.h>
+#include <DNSServer.h>
+#include <ESPAsyncWebServer.h>
 #include <HTTPClient.h>
+#include <Preferences.h>
 #include <SD.h>
 #include <SPI.h>
 #include <WiFi.h>
+#include <WiFiUdp.h>
 #include <vector>
 
 #if __has_include("secrets.h")
 #include "secrets.h"
-#endif
-
-#ifndef WIFI_SSID
-#define WIFI_SSID "CHANGE_ME"
-#endif
-
-#ifndef WIFI_PASSWORD
-#define WIFI_PASSWORD "CHANGE_ME"
-#endif
-
-#ifndef WIFI_FALLBACK_SSID
-#define WIFI_FALLBACK_SSID ""
-#endif
-
-#ifndef WIFI_FALLBACK_PASSWORD
-#define WIFI_FALLBACK_PASSWORD ""
-#endif
-
-#ifndef WIFI_FALLBACK_ENABLED
-#define WIFI_FALLBACK_ENABLED 0
-#endif
-
-#ifndef SERVER_BASE_URL
-#define SERVER_BASE_URL "http://192.168.1.100:5000"
-#endif
-
-#ifndef SERVER_FALLBACK_BASE_URL
-#define SERVER_FALLBACK_BASE_URL SERVER_BASE_URL
 #endif
 
 #ifndef HUB_ID
@@ -54,13 +31,32 @@
 #define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 #define HTTP_TIMEOUT_MS 10000
 #define CHUNK_SIZE 120
+#define DISCOVERY_PORT 50505
+#define DISCOVERY_TIMEOUT_MS 10000
+#define DISCOVERY_REFRESH_MS 60000
+#define PROVISIONING_DNS_PORT 53
+#define PROVISIONING_HTTP_PORT 80
+#define PROVISIONING_AP_SSID "ESP32HUB"
+#define PROVISIONING_AP_PASSWORD "healthsaver"
+#define BOOT_BUTTON_PIN 0
+#define BOOT_PROVISIONING_HOLD_MS 2500
+#define BOOT_PROVISIONING_WINDOW_MS 5000
+#define BOOT_RUNTIME_HOLD_MS 5000
 
 #ifndef WIFI_CONNECT_TIMEOUT_MS
-#define WIFI_CONNECT_TIMEOUT_MS 30000
+#define WIFI_CONNECT_TIMEOUT_MS 12000
 #endif
 
 #ifndef WIFI_PRIMARY_ATTEMPTS
 #define WIFI_PRIMARY_ATTEMPTS 3
+#endif
+
+#ifndef WIFI_RETRY_DELAY_MS
+#define WIFI_RETRY_DELAY_MS 30000
+#endif
+
+#ifndef BLE_VERBOSE_DATA_LOGS
+#define BLE_VERBOSE_DATA_LOGS 0
 #endif
 
 struct SensorProfile {
@@ -68,6 +64,17 @@ struct SensorProfile {
     const char* sensorType;
     const char* unit;
     float sampleRateHz;
+};
+
+struct MeasurementBatch {
+    String deviceId;
+    String sensorType;
+    String unit;
+    float sampleRateHz;
+    int schemaVersion;
+    String bleAddress;
+    String bleName;
+    std::vector<float> samples;
 };
 
 static BLEUUID serviceUUID(SERVICE_UUID);
@@ -81,9 +88,10 @@ static bool doScan = false;
 static bool isReceiving = false;
 static bool sdReady = false;
 static bool wifiConfigured = false;
-static bool uploadPending = false;
-static bool uploadInProgress = false;
 static bool bleRunning = false;
+static bool measurementCompletePending = false;
+static QueueHandle_t measurementQueue = nullptr;
+static TaskHandle_t networkTaskHandle = nullptr;
 static std::vector<float> receivedData;
 static const SensorProfile sensorProfiles[] = {
     { "ESP32_BP_Monitor", "pressure", "mmHg", 1.0f }
@@ -96,7 +104,27 @@ static int measurementSchemaVersion = 1;
 static int expectedSampleCount = -1;
 static String activeBleAddress;
 static String activeBleName;
-static String activeServerBaseUrl = SERVER_BASE_URL;
+static String configuredWifiSsid;
+static String configuredWifiPassword;
+static String activeServerBaseUrl;
+static unsigned long lastServerDiscoveryAt = 0;
+static bool provisioningMode = false;
+static bool provisioningSaved = false;
+static unsigned long provisioningRestartAt = 0;
+static Preferences preferences;
+static DNSServer dnsServer;
+static AsyncWebServer provisioningServer(PROVISIONING_HTTP_PORT);
+static WiFiUDP discoveryUdp;
+static bool discoveryUdpStarted = false;
+static unsigned long lastWiFiAttemptAt = 0;
+static unsigned long nextUploadRetryAt = 0;
+static bool bleScanPausedForWiFi = false;
+static bool wifiConnectInProgress = false;
+static unsigned long bootButtonPressedAt = 0;
+
+static void stopBle();
+static void stopWiFi();
+static void startProvisioningPortal();
 
 static String sensorTypeFromCode(const String& code) {
     if (code == "p") {
@@ -209,6 +237,211 @@ static String buildDeviceId() {
     return id;
 }
 
+static String jsonStringValue(const String& json, const String& key) {
+    String marker = "\"" + key + "\":";
+    int keyIndex = json.indexOf(marker);
+    if (keyIndex < 0) {
+        return "";
+    }
+
+    int firstQuote = json.indexOf('"', keyIndex + marker.length());
+    if (firstQuote < 0) {
+        return "";
+    }
+
+    int secondQuote = json.indexOf('"', firstQuote + 1);
+    if (secondQuote < 0) {
+        return "";
+    }
+
+    return json.substring(firstQuote + 1, secondQuote);
+}
+
+static bool loadHubConfig() {
+    preferences.begin("hubcfg", false);
+    configuredWifiSsid = preferences.getString("ssid", "");
+    configuredWifiPassword = preferences.getString("password", "");
+    activeServerBaseUrl = preferences.isKey("server") ? preferences.getString("server", "") : "";
+    preferences.end();
+
+    configuredWifiSsid.trim();
+    configuredWifiPassword.trim();
+    activeServerBaseUrl.trim();
+
+    return configuredWifiSsid.length() > 0;
+}
+
+static void saveHubConfig(const String& ssid, const String& password) {
+    preferences.begin("hubcfg", false);
+    preferences.putString("ssid", ssid);
+    preferences.putString("password", password);
+    if (preferences.isKey("server")) {
+        preferences.remove("server");
+    }
+    preferences.end();
+    activeServerBaseUrl = "";
+}
+
+static void saveDiscoveredServer(const String& baseUrl) {
+    preferences.begin("hubcfg", false);
+    preferences.putString("server", baseUrl);
+    preferences.end();
+}
+
+static void clearHubConfig() {
+    preferences.begin("hubcfg", false);
+    preferences.clear();
+    preferences.end();
+    configuredWifiSsid = "";
+    configuredWifiPassword = "";
+    activeServerBaseUrl = "";
+    lastServerDiscoveryAt = 0;
+}
+
+static bool bootButtonPressed() {
+    return digitalRead(BOOT_BUTTON_PIN) == LOW;
+}
+
+static bool waitForProvisioningButton() {
+    pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
+
+    Serial.print("Press BOOT for provisioning within ");
+    Serial.print(BOOT_PROVISIONING_WINDOW_MS / 1000);
+    Serial.println(" seconds");
+
+    unsigned long windowStarted = millis();
+    unsigned long holdStarted = 0;
+
+    while ((long)(millis() - windowStarted) < BOOT_PROVISIONING_WINDOW_MS || holdStarted > 0) {
+        if (bootButtonPressed()) {
+            if (holdStarted == 0) {
+                holdStarted = millis();
+                Serial.println("BOOT press detected");
+            }
+
+            if ((long)(millis() - holdStarted) >= BOOT_PROVISIONING_HOLD_MS) {
+                return true;
+            }
+        } else if (holdStarted > 0) {
+            holdStarted = 0;
+        }
+
+        delay(20);
+    }
+
+    return false;
+}
+
+static void enterProvisioningWithConfigClear() {
+    Serial.println("BOOT held, clearing WiFi config");
+    clearHubConfig();
+    Serial.println("Starting WiFi provisioning");
+    startProvisioningPortal();
+}
+
+static void handleRuntimeProvisioningButton() {
+    if (provisioningMode) {
+        return;
+    }
+
+    if (bootButtonPressed()) {
+        if (bootButtonPressedAt == 0) {
+            bootButtonPressedAt = millis();
+            Serial.println("BOOT press detected");
+        }
+
+        if ((long)(millis() - bootButtonPressedAt) >= BOOT_RUNTIME_HOLD_MS) {
+            enterProvisioningWithConfigClear();
+        }
+    } else {
+        bootButtonPressedAt = 0;
+    }
+}
+
+static String provisioningPage(const String& message = "") {
+    String html;
+    html.reserve(2500);
+    html += "<!doctype html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width,initial-scale=1\">";
+    html += "<title>HealthSaver Hub</title>";
+    html += "<style>body{font-family:Arial,sans-serif;margin:0;background:#f4f7fb;color:#172033}.wrap{max-width:420px;margin:0 auto;padding:32px 18px}.panel{background:white;border:1px solid #dbe3ef;border-radius:8px;padding:22px;box-shadow:0 10px 30px rgba(20,40,70,.08)}h1{font-size:24px;margin:0 0 8px}p{color:#5b6778;line-height:1.45}label{display:block;font-weight:700;margin:18px 0 8px}input{box-sizing:border-box;width:100%;font-size:16px;padding:12px;border:1px solid #b8c4d6;border-radius:6px}button{width:100%;margin-top:20px;padding:13px;border:0;border-radius:6px;background:#1463ff;color:white;font-size:16px;font-weight:700}.msg{padding:12px;background:#e8f3ff;border-radius:6px;margin:12px 0;color:#17406e}</style>";
+    html += "</head><body><main class=\"wrap\"><section class=\"panel\"><h1>HealthSaver Hub</h1><p>Enter WiFi credentials. The hub will find the ASP.NET server automatically.</p>";
+    if (message.length() > 0) {
+        html += "<div class=\"msg\">";
+        html += message;
+        html += "</div>";
+    }
+    html += "<form method=\"post\" action=\"/save\"><label for=\"ssid\">WiFi SSID</label><input id=\"ssid\" name=\"ssid\" autocomplete=\"off\" required>";
+    html += "<label for=\"password\">WiFi Password</label><input id=\"password\" name=\"password\" type=\"password\" autocomplete=\"current-password\">";
+    html += "<button type=\"submit\">Save and restart</button></form></section></main></body></html>";
+    return html;
+}
+
+static void startProvisioningPortal() {
+    if (provisioningMode) {
+        return;
+    }
+
+    stopBle();
+    stopWiFi();
+    provisioningMode = true;
+    WiFi.mode(WIFI_AP);
+    bool apStarted = WiFi.softAP(PROVISIONING_AP_SSID, PROVISIONING_AP_PASSWORD);
+
+    if (apStarted) {
+        Serial.print("Provisioning AP started: ");
+        Serial.println(PROVISIONING_AP_SSID);
+        Serial.print("Provisioning IP: ");
+        Serial.println(WiFi.softAPIP());
+    } else {
+        Serial.println("Provisioning AP start failed");
+    }
+
+    dnsServer.start(PROVISIONING_DNS_PORT, "*", WiFi.softAPIP());
+
+    provisioningServer.on("/", HTTP_GET, [](AsyncWebServerRequest* request) {
+        request->send(200, "text/html", provisioningPage());
+    });
+
+    provisioningServer.on("/save", HTTP_POST, [](AsyncWebServerRequest* request) {
+        if (!request->hasParam("ssid", true)) {
+            request->send(400, "text/html", provisioningPage("SSID is required."));
+            return;
+        }
+
+        String ssid = request->getParam("ssid", true)->value();
+        String password = request->hasParam("password", true) ? request->getParam("password", true)->value() : "";
+        ssid.trim();
+
+        if (ssid.length() == 0) {
+            request->send(400, "text/html", provisioningPage("SSID is required."));
+            return;
+        }
+
+        saveHubConfig(ssid, password);
+        request->send(200, "text/html", provisioningPage("Saved. Hub will restart now."));
+        provisioningSaved = true;
+        provisioningRestartAt = millis() + 1500;
+    });
+
+    provisioningServer.on("/generate_204", HTTP_GET, [](AsyncWebServerRequest* request) {
+        request->redirect("/");
+    });
+    provisioningServer.on("/fwlink", HTTP_GET, [](AsyncWebServerRequest* request) {
+        request->redirect("/");
+    });
+    provisioningServer.on("/hotspot-detect.html", HTTP_GET, [](AsyncWebServerRequest* request) {
+        request->send(200, "text/html", provisioningPage());
+    });
+    provisioningServer.on("/connecttest.txt", HTTP_GET, [](AsyncWebServerRequest* request) {
+        request->redirect("/");
+    });
+    provisioningServer.onNotFound([](AsyncWebServerRequest* request) {
+        request->redirect("/");
+    });
+
+    provisioningServer.begin();
+}
+
 static int findScannedNetwork(const String& targetSsid, int networks) {
     for (int i = 0; i < networks; i++) {
         if (WiFi.SSID(i) == targetSsid) {
@@ -219,16 +452,47 @@ static int findScannedNetwork(const String& targetSsid, int networks) {
     return -1;
 }
 
-static void resetWiFiStation() {
-    WiFi.disconnect(false, false);
-    delay(500);
-    WiFi.mode(WIFI_OFF);
-    delay(500);
-    WiFi.mode(WIFI_STA);
-    delay(500);
+static bool bleBusy() {
+    return isReceiving || measurementCompletePending;
 }
 
-static bool connectWiFiProfile(const char* profileName, const String& ssid, const char* password, const char* serverBaseUrl, int networks, bool lockToScannedNetwork) {
+static bool wifiBlockedByBle() {
+    return bleBusy();
+}
+
+static void pauseBleScanForWiFi() {
+    if (!bleRunning || connected || bleScanPausedForWiFi) {
+        return;
+    }
+
+    BLEDevice::getScan()->stop();
+    doScan = false;
+    bleScanPausedForWiFi = true;
+    Serial.println("BLE scan paused for WiFi");
+}
+
+static void resumeBleScanAfterWiFi() {
+    if (!bleRunning || connected || !bleScanPausedForWiFi || provisioningMode) {
+        return;
+    }
+
+    doScan = true;
+    bleScanPausedForWiFi = false;
+    Serial.println("BLE scan resumed");
+}
+
+static void resetWiFiStation() {
+    WiFi.disconnect(false, false);
+    delay(200);
+    if (!bleRunning) {
+        WiFi.mode(WIFI_OFF);
+        delay(300);
+    }
+    WiFi.mode(WIFI_STA);
+    delay(300);
+}
+
+static bool connectWiFiProfile(const char* profileName, const String& ssid, const String& password, int networks, bool lockToScannedNetwork) {
     String configuredSsid = ssid;
     configuredSsid.trim();
 
@@ -246,7 +510,7 @@ static bool connectWiFiProfile(const char* profileName, const String& ssid, cons
     Serial.print("WiFi ");
     Serial.print(profileName);
     Serial.print(" password length: ");
-    Serial.println(String(password).length());
+    Serial.println(password.length());
 
     int selectedNetwork = findScannedNetwork(configuredSsid, networks);
     uint8_t bssid[6];
@@ -272,9 +536,9 @@ static bool connectWiFiProfile(const char* profileName, const String& ssid, cons
 
     resetWiFiStation();
     if (lockToScannedNetwork && canLockToNetwork) {
-        WiFi.begin(configuredSsid.c_str(), password, channel, bssid, true);
+        WiFi.begin(configuredSsid.c_str(), password.c_str(), channel, bssid, true);
     } else {
-        WiFi.begin(configuredSsid.c_str(), password);
+        WiFi.begin(configuredSsid.c_str(), password.c_str());
     }
     Serial.print("WiFi ");
     Serial.print(profileName);
@@ -287,6 +551,14 @@ static bool connectWiFiProfile(const char* profileName, const String& ssid, cons
     unsigned long started = millis();
     wl_status_t lastStatus = WiFi.status();
     while (lastStatus != WL_CONNECTED && millis() - started < WIFI_CONNECT_TIMEOUT_MS) {
+        if (wifiBlockedByBle()) {
+            WiFi.disconnect(false, false);
+            Serial.print("WiFi ");
+            Serial.print(profileName);
+            Serial.println(" connect paused by BLE");
+            return false;
+        }
+
         delay(500);
         wl_status_t status = WiFi.status();
         if (status != lastStatus) {
@@ -313,9 +585,6 @@ static bool connectWiFiProfile(const char* profileName, const String& ssid, cons
         Serial.println(WiFi.gatewayIP());
         Serial.print("WiFi subnet: ");
         Serial.println(WiFi.subnetMask());
-        activeServerBaseUrl = serverBaseUrl;
-        Serial.print("HTTP server base URL: ");
-        Serial.println(activeServerBaseUrl);
         return true;
     }
 
@@ -328,30 +597,133 @@ static bool connectWiFiProfile(const char* profileName, const String& ssid, cons
     Serial.print(WiFi.status());
     Serial.print(" ");
     Serial.println(wifiStatusName(WiFi.status()));
+    WiFi.disconnect(false, false);
+    delay(300);
+    return false;
+}
+
+static bool discoverServer(unsigned long timeoutMs) {
+    if (WiFi.status() != WL_CONNECTED) {
+        return false;
+    }
+
+    if (!discoveryUdpStarted) {
+        discoveryUdpStarted = discoveryUdp.begin(DISCOVERY_PORT);
+        if (!discoveryUdpStarted) {
+            Serial.println("Server discovery UDP start failed");
+            return activeServerBaseUrl.length() > 0;
+        }
+    }
+
+    Serial.print("Waiting for server discovery on UDP ");
+    Serial.println(DISCOVERY_PORT);
+
+    unsigned long started = millis();
+    while (millis() - started < timeoutMs) {
+        int packetSize = discoveryUdp.parsePacket();
+        if (packetSize <= 0) {
+            delay(100);
+            continue;
+        }
+
+        char buffer[512];
+        int length = discoveryUdp.read(buffer, sizeof(buffer) - 1);
+        if (length <= 0) {
+            continue;
+        }
+
+        buffer[length] = '\0';
+        String payload = buffer;
+        if (payload.indexOf("healthsaver-server") < 0) {
+            continue;
+        }
+
+        String baseUrl = jsonStringValue(payload, "baseUrl");
+        baseUrl.trim();
+        if (baseUrl.length() == 0) {
+            continue;
+        }
+
+        activeServerBaseUrl = baseUrl;
+        lastServerDiscoveryAt = millis();
+        saveDiscoveredServer(baseUrl);
+        Serial.print("Server discovered: ");
+        Serial.println(activeServerBaseUrl);
+        return true;
+    }
+
+    if (activeServerBaseUrl.length() > 0) {
+        lastServerDiscoveryAt = millis();
+        Serial.print("Server discovery timeout, using cached URL: ");
+        Serial.println(activeServerBaseUrl);
+        return true;
+    }
+
+    Serial.println("Server discovery timeout");
     return false;
 }
 
 static bool ensureWiFi() {
     if (WiFi.status() == WL_CONNECTED) {
-        return true;
+        if (bleBusy()) {
+            return activeServerBaseUrl.length() > 0;
+        }
+
+        if (activeServerBaseUrl.length() > 0 && lastServerDiscoveryAt > 0 && (long)(millis() - lastServerDiscoveryAt) < DISCOVERY_REFRESH_MS) {
+            return true;
+        }
+
+        return discoverServer(activeServerBaseUrl.length() > 0 ? 3000 : DISCOVERY_TIMEOUT_MS);
+    }
+
+    if (configuredWifiSsid.length() == 0) {
+        Serial.println("WiFi is not configured");
+        startProvisioningPortal();
+        return false;
     }
 
     if (!wifiConfigured) {
         WiFi.persistent(false);
+        WiFi.setSleep(bleRunning);
+        WiFi.mode(WIFI_STA);
         wifiConfigured = true;
     }
 
-    WiFi.setSleep(true);
-    WiFi.mode(WIFI_OFF);
-    delay(250);
+    if (wifiBlockedByBle()) {
+        return false;
+    }
+
+    if (lastWiFiAttemptAt > 0 && (long)(millis() - lastWiFiAttemptAt) < WIFI_RETRY_DELAY_MS) {
+        return false;
+    }
+
+    lastWiFiAttemptAt = millis();
+    wifiConnectInProgress = true;
+    pauseBleScanForWiFi();
+    WiFi.setSleep(bleRunning);
     WiFi.mode(WIFI_STA);
-    delay(250);
     WiFi.disconnect(false, false);
-    delay(250);
+    delay(150);
 
     int networks = WiFi.scanNetworks(false, true);
     Serial.print("WiFi networks found: ");
     Serial.println(networks);
+
+    if (networks < 0) {
+        WiFi.scanDelete();
+        WiFi.disconnect(false, false);
+        resumeBleScanAfterWiFi();
+        wifiConnectInProgress = false;
+        Serial.println("WiFi scan failed");
+        return false;
+    }
+
+    if (wifiBlockedByBle()) {
+        WiFi.scanDelete();
+        resumeBleScanAfterWiFi();
+        wifiConnectInProgress = false;
+        return false;
+    }
 
     for (int i = 0; i < networks; i++) {
         String ssid = WiFi.SSID(i);
@@ -368,29 +740,31 @@ static bool ensureWiFi() {
     }
 
     for (int attempt = 1; attempt <= WIFI_PRIMARY_ATTEMPTS; attempt++) {
+        if (wifiBlockedByBle()) {
+            WiFi.scanDelete();
+            resumeBleScanAfterWiFi();
+            wifiConnectInProgress = false;
+            return false;
+        }
+
         Serial.print("WiFi primary attempt ");
         Serial.print(attempt);
         Serial.print("/");
         Serial.println(WIFI_PRIMARY_ATTEMPTS);
 
         bool lockToScannedNetwork = attempt % 2 == 0;
-        if (connectWiFiProfile("primary", WIFI_SSID, WIFI_PASSWORD, SERVER_BASE_URL, networks, lockToScannedNetwork)) {
+        if (connectWiFiProfile("primary", configuredWifiSsid, configuredWifiPassword, networks, lockToScannedNetwork)) {
             WiFi.scanDelete();
-            return true;
+            resumeBleScanAfterWiFi();
+            wifiConnectInProgress = false;
+            return discoverServer(activeServerBaseUrl.length() > 0 ? 3000 : DISCOVERY_TIMEOUT_MS);
         }
-    }
-
-    if (WIFI_FALLBACK_ENABLED == 1) {
-        if (connectWiFiProfile("fallback", WIFI_FALLBACK_SSID, WIFI_FALLBACK_PASSWORD, SERVER_FALLBACK_BASE_URL, networks, false)) {
-            WiFi.scanDelete();
-            return true;
-        }
-    } else {
-        Serial.println("WiFi fallback disabled");
     }
 
     WiFi.scanDelete();
-    Serial.println("WiFi all profiles failed");
+    resumeBleScanAfterWiFi();
+    wifiConnectInProgress = false;
+    Serial.println("WiFi all attempts failed");
     return false;
 }
 
@@ -437,7 +811,9 @@ static void resetMeasurementContext() {
     measurementSampleRateHz = activeProfile.sampleRateHz;
     measurementSchemaVersion = 1;
     expectedSampleCount = -1;
+    measurementCompletePending = false;
     receivedData.clear();
+    receivedData.reserve(512);
 }
 
 static void applyStartField(const String& message, const String& key, String& target) {
@@ -464,6 +840,11 @@ static const SensorProfile* resolveSensorProfile(BLEAdvertisedDevice& advertised
 
 static bool postJson(const String& path, const String& body, String* responseBody = nullptr) {
     if (!ensureWiFi()) {
+        return false;
+    }
+
+    if (activeServerBaseUrl.length() == 0) {
+        Serial.println("HTTP server URL is not available");
         return false;
     }
 
@@ -501,27 +882,11 @@ static bool postJson(const String& path, const String& body, String* responseBod
 }
 
 static String extractJsonString(const String& json, const String& key) {
-    String marker = "\"" + key + "\":";
-    int keyIndex = json.indexOf(marker);
-    if (keyIndex < 0) {
-        return "";
-    }
-
-    int firstQuote = json.indexOf('"', keyIndex + marker.length());
-    if (firstQuote < 0) {
-        return "";
-    }
-
-    int secondQuote = json.indexOf('"', firstQuote + 1);
-    if (secondQuote < 0) {
-        return "";
-    }
-
-    return json.substring(firstQuote + 1, secondQuote);
+    return jsonStringValue(json, key);
 }
 
-static void backupToSd() {
-    if (receivedData.empty()) {
+static void backupToSd(const MeasurementBatch& batch) {
+    if (batch.samples.empty()) {
         return;
     }
 
@@ -547,48 +912,48 @@ static void backupToSd() {
     }
 
     file.print("sensorType=");
-    file.println(measurementSensorType);
+    file.println(batch.sensorType);
     file.print("unit=");
-    file.println(measurementUnit);
+    file.println(batch.unit);
     file.print("sampleRateHz=");
-    file.println(measurementSampleRateHz, 2);
+    file.println(batch.sampleRateHz, 2);
     file.print("schemaVersion=");
-    file.println(measurementSchemaVersion);
+    file.println(batch.schemaVersion);
     file.print("bleAddress=");
-    file.println(activeBleAddress);
+    file.println(batch.bleAddress);
 
-    for (float value : receivedData) {
+    for (float value : batch.samples) {
         file.println(value, 2);
     }
 
     file.close();
-    Serial.printf("SD backup saved: %u samples\n", receivedData.size());
+    Serial.printf("SD backup saved: %u samples\n", batch.samples.size());
 }
 
-static String buildStartPayload() {
+static String buildStartPayload(const MeasurementBatch& batch) {
     String payload;
     payload.reserve(384);
     payload += "{\"deviceId\":\"";
-    payload += jsonEscape(buildDeviceId());
+    payload += jsonEscape(batch.deviceId);
     payload += "\",\"sensorType\":\"";
-    payload += jsonEscape(measurementSensorType);
+    payload += jsonEscape(batch.sensorType);
     payload += "\",\"schemaVersion\":";
-    payload += measurementSchemaVersion;
+    payload += batch.schemaVersion;
     payload += ",\"sampleRateHz\":";
-    payload += String(measurementSampleRateHz, 2);
+    payload += String(batch.sampleRateHz, 2);
     payload += ",\"unit\":\"";
-    payload += jsonEscape(measurementUnit);
+    payload += jsonEscape(batch.unit);
     payload += "\",\"meta\":{\"source\":\"esp32-hub\",\"hubId\":\"";
     payload += jsonEscape(String(HUB_ID));
     payload += "\",\"bleAddress\":\"";
-    payload += jsonEscape(activeBleAddress);
+    payload += jsonEscape(batch.bleAddress);
     payload += "\",\"bleName\":\"";
-    payload += jsonEscape(activeBleName);
+    payload += jsonEscape(batch.bleName);
     payload += "\"}}";
     return payload;
 }
 
-static String buildChunkPayload(const String& measurementId, int chunkIndex, int totalChunks, int startIndex, int count) {
+static String buildChunkPayload(const MeasurementBatch& batch, const String& measurementId, int chunkIndex, int totalChunks, int startIndex, int count) {
     String payload;
     payload.reserve(128 + count * 10);
     payload += "{\"measurementId\":\"";
@@ -603,14 +968,14 @@ static String buildChunkPayload(const String& measurementId, int chunkIndex, int
         if (i > 0) {
             payload += ",";
         }
-        payload += String(receivedData[startIndex + i], 2);
+        payload += String(batch.samples[startIndex + i], 2);
     }
 
     payload += "]}";
     return payload;
 }
 
-static String buildCompletePayload(const String& measurementId, int totalChunks) {
+static String buildCompletePayload(const MeasurementBatch& batch, const String& measurementId, int totalChunks) {
     String payload;
     payload.reserve(128);
     payload += "{\"measurementId\":\"";
@@ -618,19 +983,19 @@ static String buildCompletePayload(const String& measurementId, int totalChunks)
     payload += "\",\"totalChunks\":";
     payload += totalChunks;
     payload += ",\"sampleCount\":";
-    payload += receivedData.size();
+    payload += batch.samples.size();
     payload += "}";
     return payload;
 }
 
-static bool sendMeasurementToServer() {
-    if (receivedData.empty()) {
+static bool sendMeasurementToServer(const MeasurementBatch& batch) {
+    if (batch.samples.empty()) {
         Serial.println("No samples to send");
         return false;
     }
 
     String startResponse;
-    if (!postJson("/api/ingest/start", buildStartPayload(), &startResponse)) {
+    if (!postJson("/api/ingest/start", buildStartPayload(batch), &startResponse)) {
         return false;
     }
 
@@ -640,18 +1005,18 @@ static bool sendMeasurementToServer() {
         return false;
     }
 
-    int totalChunks = (receivedData.size() + CHUNK_SIZE - 1) / CHUNK_SIZE;
+    int totalChunks = (batch.samples.size() + CHUNK_SIZE - 1) / CHUNK_SIZE;
     for (int chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
         int startIndex = chunkIndex * CHUNK_SIZE;
-        int count = min((int)CHUNK_SIZE, (int)receivedData.size() - startIndex);
-        String chunkPayload = buildChunkPayload(measurementId, chunkIndex, totalChunks, startIndex, count);
+        int count = min((int)CHUNK_SIZE, (int)batch.samples.size() - startIndex);
+        String chunkPayload = buildChunkPayload(batch, measurementId, chunkIndex, totalChunks, startIndex, count);
 
         if (!postJson("/api/ingest/chunk", chunkPayload)) {
             return false;
         }
     }
 
-    if (!postJson("/api/ingest/complete", buildCompletePayload(measurementId, totalChunks))) {
+    if (!postJson("/api/ingest/complete", buildCompletePayload(batch, measurementId, totalChunks))) {
         return false;
     }
 
@@ -660,11 +1025,47 @@ static bool sendMeasurementToServer() {
     return true;
 }
 
+static MeasurementBatch* createMeasurementBatch() {
+    auto* batch = new MeasurementBatch();
+    batch->deviceId = buildDeviceId();
+    batch->sensorType = measurementSensorType;
+    batch->unit = measurementUnit;
+    batch->sampleRateHz = measurementSampleRateHz;
+    batch->schemaVersion = measurementSchemaVersion;
+    batch->bleAddress = activeBleAddress;
+    batch->bleName = activeBleName;
+    batch->samples = receivedData;
+    return batch;
+}
+
+static void enqueueCompletedMeasurement() {
+    if (receivedData.empty()) {
+        Serial.println("No samples to enqueue");
+        receivedData.clear();
+        measurementCompletePending = false;
+        return;
+    }
+
+    MeasurementBatch* batch = createMeasurementBatch();
+    backupToSd(*batch);
+
+    if (measurementQueue == nullptr || xQueueSend(measurementQueue, &batch, 0) != pdTRUE) {
+        Serial.println("Measurement queue full, upload skipped");
+        delete batch;
+    } else {
+        Serial.print("Measurement queued: ");
+        Serial.print(batch->samples.size());
+        Serial.println(" samples");
+    }
+
+    receivedData.clear();
+    measurementCompletePending = false;
+    expectedSampleCount = -1;
+}
+
 static void finishMeasurement() {
     isReceiving = false;
-    backupToSd();
-    uploadPending = true;
-    expectedSampleCount = -1;
+    measurementCompletePending = true;
 }
 
 static void disconnectBleSensor() {
@@ -777,6 +1178,11 @@ static void handleH1Data(const String& value) {
 }
 
 static void handleH1End(const String& value) {
+    if (!isReceiving) {
+        Serial.println("BLE end ignored without active measurement");
+        return;
+    }
+
     String count = partAt(value, 1);
     if (count.length() > 0) {
         expectedSampleCount = count.toInt();
@@ -793,15 +1199,65 @@ static void handleH1End(const String& value) {
     finishMeasurement();
 }
 
+static bool startsWithBytes(const uint8_t* data, size_t length, const char* prefix) {
+    size_t prefixLength = strlen(prefix);
+    if (length < prefixLength) {
+        return false;
+    }
+
+    for (size_t i = 0; i < prefixLength; i++) {
+        if ((char)data[i] != prefix[i]) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool handleH1DataBytes(const uint8_t* data, size_t length) {
+    if (!isReceiving || !startsWithBytes(data, length, "H1D;")) {
+        return false;
+    }
+
+    size_t secondSeparator = length;
+    for (size_t i = 4; i < length; i++) {
+        if ((char)data[i] == ';') {
+            secondSeparator = i;
+            break;
+        }
+    }
+
+    if (secondSeparator == length || secondSeparator + 1 >= length) {
+        return true;
+    }
+
+    char buffer[24];
+    size_t valueLength = length - secondSeparator - 1;
+    if (valueLength >= sizeof(buffer)) {
+        valueLength = sizeof(buffer) - 1;
+    }
+
+    memcpy(buffer, data + secondSeparator + 1, valueLength);
+    buffer[valueLength] = '\0';
+    receivedData.push_back(strtof(buffer, nullptr));
+    return true;
+}
+
 static void notifyCallback(BLERemoteCharacteristic* pBLERemoteCharacteristic, uint8_t* pData, size_t length, bool isNotify) {
+    if (handleH1DataBytes(pData, length)) {
+        return;
+    }
+
     String value;
     value.reserve(length);
     for (size_t i = 0; i < length; i++) {
         value += (char)pData[i];
     }
 
-    Serial.print("BLE: ");
-    Serial.println(value);
+    if (BLE_VERBOSE_DATA_LOGS || !value.startsWith("H1D;")) {
+        Serial.print("BLE: ");
+        Serial.println(value);
+    }
 
     if (value.startsWith("H1S;")) {
         handleH1Start(value);
@@ -857,7 +1313,7 @@ class MyClientCallback : public BLEClientCallbacks {
 
     void onDisconnect(BLEClient* pclient) {
         connected = false;
-        if (!uploadInProgress) {
+        if (!provisioningMode) {
             doScan = true;
         }
         Serial.println("BLE disconnected");
@@ -956,14 +1412,81 @@ static void stopBle() {
 }
 
 static void stopWiFi() {
+    if (discoveryUdpStarted) {
+        discoveryUdp.stop();
+        discoveryUdpStarted = false;
+    }
     WiFi.disconnect(true, false);
     WiFi.mode(WIFI_OFF);
     wifiConfigured = false;
 }
 
+static bool readyForUpload() {
+    return WiFi.status() == WL_CONNECTED && activeServerBaseUrl.length() > 0;
+}
+
+static void networkTask(void* parameter) {
+    MeasurementBatch* pendingBatch = nullptr;
+
+    while (true) {
+        if (provisioningMode) {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        if (configuredWifiSsid.length() > 0 && !bleBusy()) {
+            ensureWiFi();
+        }
+
+        if (pendingBatch == nullptr && measurementQueue != nullptr) {
+            xQueueReceive(measurementQueue, &pendingBatch, pdMS_TO_TICKS(1000));
+        }
+
+        if (pendingBatch != nullptr) {
+            if (nextUploadRetryAt == 0 || (long)(millis() - nextUploadRetryAt) >= 0) {
+                while (bleBusy()) {
+                    vTaskDelay(pdMS_TO_TICKS(200));
+                }
+
+                if (!readyForUpload()) {
+                    Serial.println("Measurement upload deferred: WiFi/server unavailable");
+                    nextUploadRetryAt = millis() + WIFI_RETRY_DELAY_MS;
+                    continue;
+                }
+
+                bool uploaded = sendMeasurementToServer(*pendingBatch);
+                if (!uploaded) {
+                    Serial.println("Measurement upload failed");
+                    Serial.println("Measurement retained for retry");
+                    nextUploadRetryAt = millis() + WIFI_RETRY_DELAY_MS;
+                } else {
+                    delete pendingBatch;
+                    pendingBatch = nullptr;
+                    nextUploadRetryAt = 0;
+                }
+            }
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+}
+
+static void startNetworkTask() {
+    if (networkTaskHandle != nullptr) {
+        return;
+    }
+
+    xTaskCreatePinnedToCore(networkTask, "network", 10000, nullptr, 1, &networkTaskHandle, 0);
+}
+
 void setup() {
     Serial.begin(115200);
     delay(1000);
+
+    measurementQueue = xQueueCreate(8, sizeof(MeasurementBatch*));
+    if (measurementQueue == nullptr) {
+        Serial.println("Measurement queue create failed");
+    }
 
     sdReady = SD.begin(SD_CS_PIN);
     if (sdReady) {
@@ -972,11 +1495,34 @@ void setup() {
         Serial.println("SD unavailable");
     }
 
-    startBle();
+    bool forceProvisioning = waitForProvisioningButton();
+    if (forceProvisioning) {
+        enterProvisioningWithConfigClear();
+    } else if (loadHubConfig()) {
+        Serial.print("Configured WiFi SSID: ");
+        Serial.println(configuredWifiSsid);
+        WiFi.setSleep(true);
+        startBle();
+        startNetworkTask();
+    } else {
+        Serial.println("WiFi config not found");
+        startProvisioningPortal();
+    }
 }
 
 void loop() {
-    if (doConnect) {
+    if (provisioningMode) {
+        dnsServer.processNextRequest();
+        if (provisioningSaved && (long)(millis() - provisioningRestartAt) >= 0) {
+            ESP.restart();
+        }
+        delay(10);
+        return;
+    }
+
+    handleRuntimeProvisioningButton();
+
+    if (doConnect && !wifiConnectInProgress) {
         if (connectToSensor()) {
             Serial.println("BLE sensor connected");
         } else {
@@ -985,23 +1531,13 @@ void loop() {
         doConnect = false;
     }
 
-    if (!connected && doScan && !uploadInProgress) {
+    if (!connected && doScan && !wifiConnectInProgress) {
         BLEDevice::getScan()->start(5, false);
     }
 
-    if (uploadPending) {
-        uploadInProgress = true;
-        stopBle();
-        uploadPending = false;
-        bool uploaded = sendMeasurementToServer();
-        if (!uploaded) {
-            Serial.println("Measurement upload failed");
-        }
-        stopWiFi();
-        receivedData.clear();
-        uploadInProgress = false;
-        startBle();
+    if (measurementCompletePending) {
+        enqueueCompletedMeasurement();
     }
 
-    delay(1000);
+    delay(100);
 }
