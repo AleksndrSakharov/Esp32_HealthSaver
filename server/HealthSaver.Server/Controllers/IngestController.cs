@@ -85,6 +85,12 @@ public sealed class IngestController : ControllerBase
         _db.Measurements.Add(measurement);
         await _db.SaveChangesAsync(ct);
 
+        await _liveHub.BroadcastAsync(new LiveMeasurementMessage
+        {
+            Type = "measurementStarted",
+            Measurement = ToListItem(measurement)
+        }, ct);
+
         return Ok(new MeasurementStartResponse
         {
             MeasurementId = measurementId,
@@ -183,6 +189,14 @@ public sealed class IngestController : ControllerBase
 
         await _db.SaveChangesAsync(ct);
 
+        await _db.Entry(measurement).Reference(m => m.Device).LoadAsync(ct);
+        await _db.Entry(measurement).Reference(m => m.SensorType).LoadAsync(ct);
+        await _liveHub.BroadcastAsync(new LiveMeasurementMessage
+        {
+            Type = "measurementCompleted",
+            Measurement = ToListItem(measurement)
+        }, ct);
+
         return Ok(new MeasurementCompleteResponse
         {
             Status = measurement.Status,
@@ -195,5 +209,17 @@ public sealed class IngestController : ControllerBase
         var bytes = MemoryMarshal.AsBytes(samples);
         var hash = SHA256.HashData(bytes);
         return Convert.ToHexString(hash).ToLowerInvariant();
+    }
+
+    private static MeasurementListItem ToListItem(Measurement measurement)
+    {
+        return new MeasurementListItem
+        {
+            Id = measurement.Id,
+            DeviceId = measurement.Device.DeviceId,
+            SensorType = measurement.SensorType.Code,
+            StartTimeUtc = measurement.StartTimeUtc,
+            Status = measurement.Status
+        };
     }
 }

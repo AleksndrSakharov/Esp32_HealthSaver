@@ -65,6 +65,8 @@ body {
   grid-template-columns: 320px 1fr;
   gap: 24px;
   padding: 0 32px 32px;
+  min-height: calc(100vh - 104px);
+  min-height: calc(100dvh - 104px);
 }
 
 .panel {
@@ -74,6 +76,14 @@ body {
   padding: 18px;
   backdrop-filter: blur(10px);
   min-height: 520px;
+}
+
+.list-panel {
+  display: flex;
+  flex-direction: column;
+  height: calc(100vh - 128px);
+  height: calc(100dvh - 128px);
+  min-height: 0;
 }
 
 .panel-title {
@@ -112,8 +122,32 @@ body {
 .list {
   display: grid;
   gap: 10px;
-  max-height: 480px;
-  overflow: auto;
+  flex: 1;
+  min-height: 0;
+  align-content: start;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding-right: 4px;
+  scrollbar-color: rgba(255, 183, 3, 0.75) rgba(255, 255, 255, 0.06);
+  scrollbar-width: thin;
+}
+
+.list::-webkit-scrollbar {
+  width: 8px;
+}
+
+.list::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.06);
+  border-radius: 999px;
+}
+
+.list::-webkit-scrollbar-thumb {
+  background: linear-gradient(180deg, var(--accent), rgba(76, 201, 240, 0.85));
+  border-radius: 999px;
+}
+
+.list::-webkit-scrollbar-button {
+  display: none;
 }
 
 .list-item {
@@ -121,11 +155,10 @@ body {
   border-radius: 12px;
   padding: 10px 12px;
   cursor: pointer;
-  transition: transform 0.2s ease, border-color 0.2s ease;
+  transition: border-color 0.2s ease;
 }
 
 .list-item:hover {
-  transform: translateY(-2px);
   border-color: rgba(255, 183, 3, 0.6);
 }
 
@@ -161,9 +194,16 @@ body {
 @media (max-width: 960px) {
   .layout {
     grid-template-columns: 1fr;
+    min-height: auto;
   }
 
   .panel {
     min-height: auto;
+  }
+
+  .list-panel {
+    height: calc(100vh - 132px);
+    height: calc(100dvh - 132px);
+    min-height: 520px;
   }
 }

@@ -9,6 +9,8 @@ let chart;
 let selectedId = null;
 let latestIndex = 0;
 let currentSampleRate = 1;
+let currentUnit = "";
+let measurements = [];
 
 async function fetchJson(url) {
   const response = await fetch(url);
@@ -38,6 +40,39 @@ function renderList(items) {
   });
 }
 
+function passesCurrentFilters(item) {
+  const device = filterDevice.value.trim();
+  const sensor = filterSensor.value.trim();
+
+  if (device && item.deviceId !== device) {
+    return false;
+  }
+
+  if (sensor && item.sensorType !== sensor) {
+    return false;
+  }
+
+  return true;
+}
+
+function upsertMeasurement(item) {
+  if (!passesCurrentFilters(item)) {
+    measurements = measurements.filter(existing => existing.id !== item.id);
+    renderList(measurements);
+    return;
+  }
+
+  const index = measurements.findIndex(existing => existing.id === item.id);
+  if (index >= 0) {
+    measurements[index] = item;
+  } else {
+    measurements.unshift(item);
+  }
+
+  measurements.sort((a, b) => new Date(b.startTimeUtc) - new Date(a.startTimeUtc));
+  renderList(measurements);
+}
+
 function renderDetail(detail) {
   detailEl.innerHTML = `
     <div><strong>Device:</strong> ${detail.deviceId}</div>
@@ -50,10 +85,11 @@ function renderDetail(detail) {
   `;
 }
 
-function ensureChart(points, sampleRate) {
+function ensureChart(points, sampleRate, unit) {
   const ctx = document.getElementById("chart");
   const labels = points.map(p => (p.index / sampleRate).toFixed(2));
   const data = points.map(p => p.value);
+  const valueUnit = unit || "";
 
   if (!chart) {
     chart = new Chart(ctx, {
@@ -73,6 +109,25 @@ function ensureChart(points, sampleRate) {
       },
       options: {
         responsive: true,
+        interaction: {
+          intersect: false,
+          mode: "index"
+        },
+        plugins: {
+          tooltip: {
+            callbacks: {
+              title: items => {
+                const item = items[0];
+                return item ? `Time: ${item.label} s` : "";
+              },
+              label: item => {
+                const value = item.parsed.y;
+                const formatted = Number.isFinite(value) ? value.toFixed(2) : item.formattedValue;
+                return valueUnit ? `Value: ${formatted} ${valueUnit}` : `Value: ${formatted}`;
+              }
+            }
+          }
+        },
         scales: {
           x: {
             title: { display: true, text: "Time (s)" }
@@ -91,6 +146,7 @@ function ensureChart(points, sampleRate) {
 
   latestIndex = points.length > 0 ? points[points.length - 1].index : 0;
   currentSampleRate = sampleRate || 1;
+  currentUnit = valueUnit;
 }
 
 function appendLivePoints(points, sampleRate) {
@@ -117,7 +173,8 @@ async function loadMeasurements() {
   }
 
   const items = await fetchJson(`/api/measurements?${query.toString()}`);
-  renderList(items);
+  measurements = items;
+  renderList(measurements);
 }
 
 async function selectMeasurement(id) {
@@ -125,10 +182,11 @@ async function selectMeasurement(id) {
   await loadMeasurements();
 
   const detail = await fetchJson(`/api/measurements/${id}`);
+  currentUnit = detail.unit || "";
   renderDetail(detail);
 
   const series = await fetchJson(`/api/measurements/${id}/series?maxPoints=1200`);
-  ensureChart(series.points, series.sampleRateHz);
+  ensureChart(series.points, series.sampleRateHz, currentUnit);
 }
 
 refreshButton.addEventListener("click", () => loadMeasurements());
@@ -146,6 +204,15 @@ ws.addEventListener("close", () => {
 
 ws.addEventListener("message", event => {
   const message = JSON.parse(event.data);
+
+  if (message.type === "measurementStarted" || message.type === "measurementCompleted") {
+    upsertMeasurement(message.measurement);
+    if (message.type === "measurementCompleted") {
+      selectMeasurement(message.measurement.id);
+    }
+    return;
+  }
+
   if (message.measurementId !== selectedId) {
     return;
   }
