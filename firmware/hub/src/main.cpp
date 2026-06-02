@@ -42,6 +42,20 @@
 #define BOOT_PROVISIONING_HOLD_MS 2500
 #define BOOT_PROVISIONING_WINDOW_MS 5000
 #define BOOT_RUNTIME_HOLD_MS 5000
+#define MAX_RECEIVED_SAMPLES 700
+#define SERVER_URL_MAX_LENGTH 96
+
+#ifndef SD_BACKUP_ENABLED
+#define SD_BACKUP_ENABLED 1
+#endif
+
+#ifndef SD_BACKUP_MIN_FREE_HEAP
+#define SD_BACKUP_MIN_FREE_HEAP 50000
+#endif
+
+#ifndef HTTP_UPLOAD_MIN_FREE_HEAP
+#define HTTP_UPLOAD_MIN_FREE_HEAP 45000
+#endif
 
 #ifndef WIFI_CONNECT_TIMEOUT_MS
 #define WIFI_CONNECT_TIMEOUT_MS 12000
@@ -92,7 +106,8 @@ static bool bleRunning = false;
 static bool measurementCompletePending = false;
 static QueueHandle_t measurementQueue = nullptr;
 static TaskHandle_t networkTaskHandle = nullptr;
-static std::vector<float> receivedData;
+static float receivedData[MAX_RECEIVED_SAMPLES];
+static size_t receivedDataCount = 0;
 static const SensorProfile sensorProfiles[] = {
     { "ESP32_BP_Monitor", "pressure", "mmHg", 1.0f }
 };
@@ -106,7 +121,7 @@ static String activeBleAddress;
 static String activeBleName;
 static String configuredWifiSsid;
 static String configuredWifiPassword;
-static String activeServerBaseUrl;
+static char activeServerBaseUrl[SERVER_URL_MAX_LENGTH] = "";
 static unsigned long lastServerDiscoveryAt = 0;
 static bool provisioningMode = false;
 static bool provisioningSaved = false;
@@ -120,6 +135,7 @@ static unsigned long lastWiFiAttemptAt = 0;
 static unsigned long nextUploadRetryAt = 0;
 static bool bleScanPausedForWiFi = false;
 static bool wifiConnectInProgress = false;
+static bool bleConnectInProgress = false;
 static unsigned long bootButtonPressedAt = 0;
 
 static void stopBle();
@@ -261,12 +277,13 @@ static bool loadHubConfig() {
     preferences.begin("hubcfg", false);
     configuredWifiSsid = preferences.getString("ssid", "");
     configuredWifiPassword = preferences.getString("password", "");
-    activeServerBaseUrl = preferences.isKey("server") ? preferences.getString("server", "") : "";
+    String cachedServer = preferences.isKey("server") ? preferences.getString("server", "") : "";
     preferences.end();
 
     configuredWifiSsid.trim();
     configuredWifiPassword.trim();
-    activeServerBaseUrl.trim();
+    cachedServer.trim();
+    strlcpy(activeServerBaseUrl, cachedServer.c_str(), sizeof(activeServerBaseUrl));
 
     return configuredWifiSsid.length() > 0;
 }
@@ -279,7 +296,7 @@ static void saveHubConfig(const String& ssid, const String& password) {
         preferences.remove("server");
     }
     preferences.end();
-    activeServerBaseUrl = "";
+    activeServerBaseUrl[0] = '\0';
 }
 
 static void saveDiscoveredServer(const String& baseUrl) {
@@ -294,7 +311,7 @@ static void clearHubConfig() {
     preferences.end();
     configuredWifiSsid = "";
     configuredWifiPassword = "";
-    activeServerBaseUrl = "";
+    activeServerBaseUrl[0] = '\0';
     lastServerDiscoveryAt = 0;
 }
 
@@ -453,7 +470,11 @@ static int findScannedNetwork(const String& targetSsid, int networks) {
 }
 
 static bool bleBusy() {
-    return isReceiving || measurementCompletePending;
+    return isReceiving || measurementCompletePending || bleConnectInProgress || doConnect;
+}
+
+static bool bleConnectedOrBusy() {
+    return connected || bleBusy();
 }
 
 static bool wifiBlockedByBle() {
@@ -479,6 +500,17 @@ static void resumeBleScanAfterWiFi() {
     doScan = true;
     bleScanPausedForWiFi = false;
     Serial.println("BLE scan resumed");
+}
+
+static void stopDisconnectedWiFiRadio() {
+    if (WiFi.status() == WL_CONNECTED) {
+        return;
+    }
+
+    WiFi.disconnect(true, false);
+    WiFi.mode(WIFI_OFF);
+    wifiConfigured = false;
+    delay(500);
 }
 
 static void resetWiFiStation() {
@@ -611,7 +643,7 @@ static bool discoverServer(unsigned long timeoutMs) {
         discoveryUdpStarted = discoveryUdp.begin(DISCOVERY_PORT);
         if (!discoveryUdpStarted) {
             Serial.println("Server discovery UDP start failed");
-            return activeServerBaseUrl.length() > 0;
+            return activeServerBaseUrl[0] != '\0';
         }
     }
 
@@ -644,7 +676,7 @@ static bool discoverServer(unsigned long timeoutMs) {
             continue;
         }
 
-        activeServerBaseUrl = baseUrl;
+        strlcpy(activeServerBaseUrl, baseUrl.c_str(), sizeof(activeServerBaseUrl));
         lastServerDiscoveryAt = millis();
         saveDiscoveredServer(baseUrl);
         Serial.print("Server discovered: ");
@@ -652,7 +684,7 @@ static bool discoverServer(unsigned long timeoutMs) {
         return true;
     }
 
-    if (activeServerBaseUrl.length() > 0) {
+    if (activeServerBaseUrl[0] != '\0') {
         lastServerDiscoveryAt = millis();
         Serial.print("Server discovery timeout, using cached URL: ");
         Serial.println(activeServerBaseUrl);
@@ -666,14 +698,14 @@ static bool discoverServer(unsigned long timeoutMs) {
 static bool ensureWiFi() {
     if (WiFi.status() == WL_CONNECTED) {
         if (bleBusy()) {
-            return activeServerBaseUrl.length() > 0;
+            return activeServerBaseUrl[0] != '\0';
         }
 
-        if (activeServerBaseUrl.length() > 0 && lastServerDiscoveryAt > 0 && (long)(millis() - lastServerDiscoveryAt) < DISCOVERY_REFRESH_MS) {
+        if (activeServerBaseUrl[0] != '\0' && lastServerDiscoveryAt > 0 && (long)(millis() - lastServerDiscoveryAt) < DISCOVERY_REFRESH_MS) {
             return true;
         }
 
-        return discoverServer(activeServerBaseUrl.length() > 0 ? 3000 : DISCOVERY_TIMEOUT_MS);
+        return discoverServer(activeServerBaseUrl[0] != '\0' ? 3000 : DISCOVERY_TIMEOUT_MS);
     }
 
     if (configuredWifiSsid.length() == 0) {
@@ -757,13 +789,16 @@ static bool ensureWiFi() {
             WiFi.scanDelete();
             resumeBleScanAfterWiFi();
             wifiConnectInProgress = false;
-            return discoverServer(activeServerBaseUrl.length() > 0 ? 3000 : DISCOVERY_TIMEOUT_MS);
+            return discoverServer(activeServerBaseUrl[0] != '\0' ? 3000 : DISCOVERY_TIMEOUT_MS);
         }
     }
 
     WiFi.scanDelete();
     resumeBleScanAfterWiFi();
     wifiConnectInProgress = false;
+    if (!bleRunning) {
+        stopDisconnectedWiFiRadio();
+    }
     Serial.println("WiFi all attempts failed");
     return false;
 }
@@ -812,8 +847,17 @@ static void resetMeasurementContext() {
     measurementSchemaVersion = 1;
     expectedSampleCount = -1;
     measurementCompletePending = false;
-    receivedData.clear();
-    receivedData.reserve(512);
+    receivedDataCount = 0;
+}
+
+static bool addReceivedSample(float value) {
+    if (receivedDataCount >= MAX_RECEIVED_SAMPLES) {
+        Serial.println("Received sample buffer full");
+        return false;
+    }
+
+    receivedData[receivedDataCount++] = value;
+    return true;
 }
 
 static void applyStartField(const String& message, const String& key, String& target) {
@@ -843,13 +887,21 @@ static bool postJson(const String& path, const String& body, String* responseBod
         return false;
     }
 
-    if (activeServerBaseUrl.length() == 0) {
+    if (activeServerBaseUrl[0] == '\0') {
         Serial.println("HTTP server URL is not available");
         return false;
     }
 
+    uint32_t freeHeap = ESP.getFreeHeap();
+    if (freeHeap < HTTP_UPLOAD_MIN_FREE_HEAP) {
+        Serial.print("HTTP POST deferred, free heap: ");
+        Serial.println(freeHeap);
+        return false;
+    }
+
     HTTPClient http;
-    String url = activeServerBaseUrl + path;
+    char url[SERVER_URL_MAX_LENGTH + 40];
+    snprintf(url, sizeof(url), "%s%s", activeServerBaseUrl, path.c_str());
     Serial.print("HTTP POST ");
     Serial.println(url);
     http.setTimeout(HTTP_TIMEOUT_MS);
@@ -886,7 +938,15 @@ static String extractJsonString(const String& json, const String& key) {
 }
 
 static void backupToSd(const MeasurementBatch& batch) {
+#if SD_BACKUP_ENABLED
     if (batch.samples.empty()) {
+        return;
+    }
+
+    uint32_t freeHeap = ESP.getFreeHeap();
+    if (freeHeap < SD_BACKUP_MIN_FREE_HEAP) {
+        Serial.print("SD backup skipped, free heap: ");
+        Serial.println(freeHeap);
         return;
     }
 
@@ -928,6 +988,9 @@ static void backupToSd(const MeasurementBatch& batch) {
 
     file.close();
     Serial.printf("SD backup saved: %u samples\n", batch.samples.size());
+#else
+    (void)batch;
+#endif
 }
 
 static String buildStartPayload(const MeasurementBatch& batch) {
@@ -1034,31 +1097,35 @@ static MeasurementBatch* createMeasurementBatch() {
     batch->schemaVersion = measurementSchemaVersion;
     batch->bleAddress = activeBleAddress;
     batch->bleName = activeBleName;
-    batch->samples = receivedData;
+    batch->samples.reserve(receivedDataCount);
+    for (size_t i = 0; i < receivedDataCount; i++) {
+        batch->samples.push_back(receivedData[i]);
+    }
     return batch;
 }
 
 static void enqueueCompletedMeasurement() {
-    if (receivedData.empty()) {
+    if (receivedDataCount == 0) {
         Serial.println("No samples to enqueue");
-        receivedData.clear();
+        receivedDataCount = 0;
         measurementCompletePending = false;
         return;
     }
 
     MeasurementBatch* batch = createMeasurementBatch();
-    backupToSd(*batch);
 
     if (measurementQueue == nullptr || xQueueSend(measurementQueue, &batch, 0) != pdTRUE) {
         Serial.println("Measurement queue full, upload skipped");
+        backupToSd(*batch);
         delete batch;
     } else {
         Serial.print("Measurement queued: ");
         Serial.print(batch->samples.size());
         Serial.println(" samples");
+        backupToSd(*batch);
     }
 
-    receivedData.clear();
+    receivedDataCount = 0;
     measurementCompletePending = false;
     expectedSampleCount = -1;
 }
@@ -1080,6 +1147,11 @@ static void disconnectBleSensor() {
 }
 
 static void handleHs1Start(const String& value) {
+    if (isReceiving) {
+        Serial.println("BLE start ignored: measurement already active");
+        return;
+    }
+
     resetMeasurementContext();
     applyStartField(value, "type", measurementSensorType);
     applyStartField(value, "unit", measurementUnit);
@@ -1114,7 +1186,7 @@ static void handleHs1Chunk(const String& value) {
         String sample = values.substring(start, end);
         sample.trim();
         if (sample.length() > 0) {
-            receivedData.push_back(sample.toFloat());
+            addReceivedSample(sample.toFloat());
         }
 
         start = end + 1;
@@ -1127,11 +1199,11 @@ static void handleHs1End(const String& value) {
         expectedSampleCount = count.toInt();
     }
 
-    if (expectedSampleCount >= 0 && expectedSampleCount != (int)receivedData.size()) {
+    if (expectedSampleCount >= 0 && expectedSampleCount != (int)receivedDataCount) {
         Serial.print("Sample count mismatch: ");
         Serial.print(expectedSampleCount);
         Serial.print(" expected, ");
-        Serial.print(receivedData.size());
+        Serial.print(receivedDataCount);
         Serial.println(" received");
     }
 
@@ -1139,6 +1211,11 @@ static void handleHs1End(const String& value) {
 }
 
 static void handleH1Start(const String& value) {
+    if (isReceiving) {
+        Serial.println("BLE start ignored: measurement already active");
+        return;
+    }
+
     resetMeasurementContext();
 
     String sensorCode = partAt(value, 1);
@@ -1173,7 +1250,7 @@ static void handleH1Data(const String& value) {
     String sample = partAt(value, 2);
     sample.trim();
     if (sample.length() > 0) {
-        receivedData.push_back(sample.toFloat());
+        addReceivedSample(sample.toFloat());
     }
 }
 
@@ -1188,11 +1265,11 @@ static void handleH1End(const String& value) {
         expectedSampleCount = count.toInt();
     }
 
-    if (expectedSampleCount >= 0 && expectedSampleCount != (int)receivedData.size()) {
+    if (expectedSampleCount >= 0 && expectedSampleCount != (int)receivedDataCount) {
         Serial.print("Sample count mismatch: ");
         Serial.print(expectedSampleCount);
         Serial.print(" expected, ");
-        Serial.print(receivedData.size());
+        Serial.print(receivedDataCount);
         Serial.println(" received");
     }
 
@@ -1239,7 +1316,7 @@ static bool handleH1DataBytes(const uint8_t* data, size_t length) {
 
     memcpy(buffer, data + secondSeparator + 1, valueLength);
     buffer[valueLength] = '\0';
-    receivedData.push_back(strtof(buffer, nullptr));
+    addReceivedSample(strtof(buffer, nullptr));
     return true;
 }
 
@@ -1301,7 +1378,7 @@ static void notifyCallback(BLERemoteCharacteristic* pBLERemoteCharacteristic, ui
     }
 
     if (isReceiving && value.startsWith("D:")) {
-        receivedData.push_back(value.substring(2).toFloat());
+        addReceivedSample(value.substring(2).toFloat());
     }
 }
 
@@ -1325,6 +1402,7 @@ static bool connectToSensor() {
         return false;
     }
 
+    bleConnectInProgress = true;
     activeBleAddress = myDevice->getAddress().toString().c_str();
     activeBleName = myDevice->getName().c_str();
 
@@ -1336,6 +1414,7 @@ static bool connectToSensor() {
 
     if (!pClient->connect(myDevice)) {
         Serial.println("BLE connect failed");
+        bleConnectInProgress = false;
         return false;
     }
 
@@ -1343,6 +1422,7 @@ static bool connectToSensor() {
     if (pRemoteService == nullptr) {
         Serial.println("BLE service not found");
         pClient->disconnect();
+        bleConnectInProgress = false;
         return false;
     }
 
@@ -1350,6 +1430,7 @@ static bool connectToSensor() {
     if (pRemoteCharacteristic == nullptr) {
         Serial.println("BLE characteristic not found");
         pClient->disconnect();
+        bleConnectInProgress = false;
         return false;
     }
 
@@ -1358,6 +1439,7 @@ static bool connectToSensor() {
     }
 
     connected = true;
+    bleConnectInProgress = false;
     return true;
 }
 
@@ -1384,6 +1466,7 @@ static void startBle() {
         return;
     }
 
+    stopDisconnectedWiFiRadio();
     BLEDevice::init("");
     BLEScan* pBLEScan = BLEDevice::getScan();
     pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
@@ -1403,12 +1486,20 @@ static void stopBle() {
     disconnectBleSensor();
     BLEDevice::getScan()->stop();
     BLEDevice::deinit(false);
+    if (pClient != nullptr) {
+        delete pClient;
+    }
+    if (myDevice != nullptr) {
+        delete myDevice;
+    }
     bleRunning = false;
     doConnect = false;
     doScan = false;
     connected = false;
+    bleConnectInProgress = false;
     pClient = nullptr;
     pRemoteCharacteristic = nullptr;
+    myDevice = nullptr;
 }
 
 static void stopWiFi() {
@@ -1422,11 +1513,51 @@ static void stopWiFi() {
 }
 
 static bool readyForUpload() {
-    return WiFi.status() == WL_CONNECTED && activeServerBaseUrl.length() > 0;
+    return WiFi.status() == WL_CONNECTED && activeServerBaseUrl[0] != '\0';
+}
+
+static void closeWiFiUploadWindow() {
+    stopWiFi();
+    lastWiFiAttemptAt = 0;
+    nextUploadRetryAt = millis() + WIFI_RETRY_DELAY_MS;
+}
+
+static bool releaseBleForUploadIfNeeded(bool forceRelease) {
+    if (!bleRunning || isReceiving || measurementCompletePending || bleConnectInProgress) {
+        return false;
+    }
+
+    uint32_t freeHeap = ESP.getFreeHeap();
+    if (!forceRelease && freeHeap >= HTTP_UPLOAD_MIN_FREE_HEAP) {
+        return false;
+    }
+
+    Serial.print("Releasing BLE for HTTP upload, free heap: ");
+    Serial.println(freeHeap);
+    wifiConnectInProgress = true;
+    stopBle();
+    delay(700);
+    Serial.print("Heap after BLE release: ");
+    Serial.println(ESP.getFreeHeap());
+    return true;
+}
+
+static void restoreBleAfterUpload(bool releasedBle) {
+    if (!releasedBle || provisioningMode) {
+        wifiConnectInProgress = false;
+        return;
+    }
+
+    closeWiFiUploadWindow();
+    startBle();
+    wifiConnectInProgress = false;
+    Serial.print("Heap after BLE restart: ");
+    Serial.println(ESP.getFreeHeap());
 }
 
 static void networkTask(void* parameter) {
     MeasurementBatch* pendingBatch = nullptr;
+    bool waitingForConnectivity = false;
 
     while (true) {
         if (provisioningMode) {
@@ -1434,35 +1565,60 @@ static void networkTask(void* parameter) {
             continue;
         }
 
-        if (configuredWifiSsid.length() > 0 && !bleBusy()) {
-            ensureWiFi();
-        }
-
         if (pendingBatch == nullptr && measurementQueue != nullptr) {
             xQueueReceive(measurementQueue, &pendingBatch, pdMS_TO_TICKS(1000));
         }
 
         if (pendingBatch != nullptr) {
+            if (waitingForConnectivity && readyForUpload() && nextUploadRetryAt != 0) {
+                nextUploadRetryAt = 0;
+                waitingForConnectivity = false;
+                Serial.println("Upload retry released: WiFi/server ready");
+            }
+
             if (nextUploadRetryAt == 0 || (long)(millis() - nextUploadRetryAt) >= 0) {
                 while (bleBusy()) {
                     vTaskDelay(pdMS_TO_TICKS(200));
                 }
 
+                bool releasedBle = releaseBleForUploadIfNeeded(true);
+
                 if (!readyForUpload()) {
+                    Serial.println("Connecting WiFi for queued measurement");
+                    ensureWiFi();
+                }
+
+                if (!readyForUpload()) {
+                    restoreBleAfterUpload(releasedBle);
                     Serial.println("Measurement upload deferred: WiFi/server unavailable");
+                    waitingForConnectivity = true;
                     nextUploadRetryAt = millis() + WIFI_RETRY_DELAY_MS;
+                    Serial.print("Measurement retry in ms: ");
+                    Serial.println(WIFI_RETRY_DELAY_MS);
                     continue;
                 }
 
-                bool uploaded = sendMeasurementToServer(*pendingBatch);
+                bool uploaded = false;
+                if (ESP.getFreeHeap() < HTTP_UPLOAD_MIN_FREE_HEAP) {
+                    Serial.print("Measurement upload deferred: low heap ");
+                    Serial.println(ESP.getFreeHeap());
+                } else {
+                    uploaded = sendMeasurementToServer(*pendingBatch);
+                }
+                restoreBleAfterUpload(releasedBle);
+
                 if (!uploaded) {
                     Serial.println("Measurement upload failed");
                     Serial.println("Measurement retained for retry");
+                    waitingForConnectivity = false;
                     nextUploadRetryAt = millis() + WIFI_RETRY_DELAY_MS;
+                    Serial.print("Measurement retry in ms: ");
+                    Serial.println(WIFI_RETRY_DELAY_MS);
                 } else {
                     delete pendingBatch;
                     pendingBatch = nullptr;
-                    nextUploadRetryAt = 0;
+                    nextUploadRetryAt = millis() + WIFI_RETRY_DELAY_MS;
+                    waitingForConnectivity = false;
                 }
             }
         }
