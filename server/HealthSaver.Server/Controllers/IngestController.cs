@@ -204,6 +204,118 @@ public sealed class IngestController : ControllerBase
         });
     }
 
+    [HttpPost("measurement")]
+    public async Task<ActionResult<MeasurementStartResponse>> Measurement([FromBody] MeasurementUploadRequest request, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(request.DeviceId) || string.IsNullOrWhiteSpace(request.SensorType))
+        {
+            return BadRequest("DeviceId and SensorType are required.");
+        }
+
+        float[] samples;
+        if (request.Samples != null && request.Samples.Count > 0)
+        {
+            samples = request.Samples.ToArray();
+        }
+        else if (!string.IsNullOrWhiteSpace(request.DataBase64))
+        {
+            samples = BinarySampleCodec.DecodeF32LeBase64(request.DataBase64);
+        }
+        else
+        {
+            return BadRequest("Samples or DataBase64 payload is required.");
+        }
+
+        var device = await _db.Devices.FirstOrDefaultAsync(d => d.DeviceId == request.DeviceId, ct);
+        if (device == null)
+        {
+            device = new Device
+            {
+                DeviceId = request.DeviceId,
+                LastSeenUtc = DateTime.UtcNow
+            };
+            _db.Devices.Add(device);
+        }
+        else
+        {
+            device.LastSeenUtc = DateTime.UtcNow;
+        }
+
+        var sensor = await _db.SensorTypes.FirstOrDefaultAsync(s => s.Code == request.SensorType && s.SchemaVersion == request.SchemaVersion, ct);
+        if (sensor == null)
+        {
+            sensor = new SensorType
+            {
+                Code = request.SensorType,
+                SchemaVersion = request.SchemaVersion,
+                Unit = request.Unit
+            };
+            _db.SensorTypes.Add(sensor);
+        }
+
+        var measurementId = request.MeasurementId ?? Guid.NewGuid();
+        var exists = await _db.Measurements.AnyAsync(m => m.Id == measurementId, ct);
+        if (exists)
+        {
+            return Conflict("MeasurementId already exists.");
+        }
+
+        var added = await _storage.AppendSamplesAsync(measurementId, samples, ct);
+        var measurement = new Measurement
+        {
+            Id = measurementId,
+            Device = device,
+            SensorType = sensor,
+            Status = MeasurementStatus.Completed,
+            SampleRateHz = request.SampleRateHz,
+            Unit = request.Unit ?? sensor.Unit ?? string.Empty,
+            StartTimeUtc = request.StartTimeUtc ?? DateTime.UtcNow,
+            CompletedUtc = DateTime.UtcNow,
+            RawFilePath = _storage.GetRawPath(measurementId),
+            RawSha256 = await _storage.ComputeSha256Async(measurementId, ct),
+            SampleCount = added,
+            ChunkCount = 1,
+            MetaJson = request.Meta == null ? null : JsonSerializer.Serialize(request.Meta)
+        };
+
+        _db.Measurements.Add(measurement);
+        _db.MeasurementChunks.Add(new MeasurementChunk
+        {
+            MeasurementId = measurementId,
+            ChunkIndex = 0,
+            SizeBytes = added * 4,
+            Sha256 = ComputeSha256(samples)
+        });
+
+        await _db.SaveChangesAsync(ct);
+
+        await _liveHub.BroadcastAsync(new LiveMeasurementMessage
+        {
+            Type = "measurementStarted",
+            Measurement = ToListItem(measurement)
+        }, ct);
+
+        var downsampled = Downsample.MinMax(samples, Math.Max(10, _options.MaxLivePoints));
+        await _liveHub.BroadcastAsync(new LiveChunkMessage
+        {
+            MeasurementId = measurementId,
+            ChunkIndex = 0,
+            Points = downsampled
+        }, ct);
+
+        await _liveHub.BroadcastAsync(new LiveMeasurementMessage
+        {
+            Type = "measurementCompleted",
+            Measurement = ToListItem(measurement)
+        }, ct);
+
+        return Ok(new MeasurementStartResponse
+        {
+            MeasurementId = measurementId,
+            Status = measurement.Status
+        });
+    }
+
     private static string ComputeSha256(ReadOnlySpan<float> samples)
     {
         var bytes = MemoryMarshal.AsBytes(samples);

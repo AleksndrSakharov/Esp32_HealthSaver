@@ -1,18 +1,14 @@
 #include <Arduino.h>
 #include <AsyncTCP.h>
-#include <BLEAdvertisedDevice.h>
-#include <BLEDevice.h>
-#include <BLEScan.h>
-#include <BLEUtils.h>
 #include <DNSServer.h>
 #include <ESPAsyncWebServer.h>
-#include <HTTPClient.h>
+#include <NimBLEDevice.h>
 #include <Preferences.h>
 #include <SD.h>
 #include <SPI.h>
 #include <WiFi.h>
+#include <WiFiClient.h>
 #include <WiFiUdp.h>
-#include <vector>
 
 #if __has_include("secrets.h")
 #include "secrets.h"
@@ -30,7 +26,7 @@
 #define SERVICE_UUID "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 #define HTTP_TIMEOUT_MS 10000
-#define CHUNK_SIZE 120
+#define CHUNK_SIZE 60
 #define DISCOVERY_PORT 50505
 #define DISCOVERY_TIMEOUT_MS 10000
 #define DISCOVERY_REFRESH_MS 60000
@@ -42,8 +38,10 @@
 #define BOOT_PROVISIONING_HOLD_MS 2500
 #define BOOT_PROVISIONING_WINDOW_MS 5000
 #define BOOT_RUNTIME_HOLD_MS 5000
-#define MAX_RECEIVED_SAMPLES 700
+#define MAX_RECEIVED_SAMPLES 1200
 #define SERVER_URL_MAX_LENGTH 96
+#define QUEUE_DIR "/queue"
+#define QUEUE_PATH_MAX_LENGTH 40
 
 #ifndef SD_BACKUP_ENABLED
 #define SD_BACKUP_ENABLED 1
@@ -54,7 +52,7 @@
 #endif
 
 #ifndef HTTP_UPLOAD_MIN_FREE_HEAP
-#define HTTP_UPLOAD_MIN_FREE_HEAP 45000
+#define HTTP_UPLOAD_MIN_FREE_HEAP 12000
 #endif
 
 #ifndef WIFI_CONNECT_TIMEOUT_MS
@@ -69,6 +67,10 @@
 #define WIFI_RETRY_DELAY_MS 30000
 #endif
 
+#ifndef BLE_UPLOAD_QUIET_MS
+#define BLE_UPLOAD_QUIET_MS 1500
+#endif
+
 #ifndef BLE_VERBOSE_DATA_LOGS
 #define BLE_VERBOSE_DATA_LOGS 0
 #endif
@@ -80,7 +82,7 @@ struct SensorProfile {
     float sampleRateHz;
 };
 
-struct MeasurementBatch {
+struct MeasurementMetadata {
     String deviceId;
     String sensorType;
     String unit;
@@ -88,14 +90,18 @@ struct MeasurementBatch {
     int schemaVersion;
     String bleAddress;
     String bleName;
-    std::vector<float> samples;
+    size_t sampleCount;
 };
 
-static BLEUUID serviceUUID(SERVICE_UUID);
-static BLEUUID charUUID(CHARACTERISTIC_UUID);
-static BLEClient* pClient = nullptr;
-static BLERemoteCharacteristic* pRemoteCharacteristic = nullptr;
-static BLEAdvertisedDevice* myDevice = nullptr;
+struct PendingMeasurementRef {
+    char path[QUEUE_PATH_MAX_LENGTH];
+};
+
+static NimBLEUUID serviceUUID(SERVICE_UUID);
+static NimBLEUUID charUUID(CHARACTERISTIC_UUID);
+static NimBLEClient* pClient = nullptr;
+static NimBLERemoteCharacteristic* pRemoteCharacteristic = nullptr;
+static NimBLEAdvertisedDevice* myDevice = nullptr;
 static bool doConnect = false;
 static bool connected = false;
 static bool doScan = false;
@@ -105,9 +111,11 @@ static bool wifiConfigured = false;
 static bool bleRunning = false;
 static bool measurementCompletePending = false;
 static QueueHandle_t measurementQueue = nullptr;
+static SemaphoreHandle_t sdMutex = nullptr;
 static TaskHandle_t networkTaskHandle = nullptr;
 static float receivedData[MAX_RECEIVED_SAMPLES];
 static size_t receivedDataCount = 0;
+static bool receivedDataOverflowLogged = false;
 static const SensorProfile sensorProfiles[] = {
     { "ESP32_BP_Monitor", "pressure", "mmHg", 1.0f }
 };
@@ -133,6 +141,7 @@ static WiFiUDP discoveryUdp;
 static bool discoveryUdpStarted = false;
 static unsigned long lastWiFiAttemptAt = 0;
 static unsigned long nextUploadRetryAt = 0;
+static unsigned long lastBleActivityAt = 0;
 static bool bleScanPausedForWiFi = false;
 static bool wifiConnectInProgress = false;
 static bool bleConnectInProgress = false;
@@ -478,7 +487,7 @@ static bool bleConnectedOrBusy() {
 }
 
 static bool wifiBlockedByBle() {
-    return bleBusy();
+    return false;
 }
 
 static void pauseBleScanForWiFi() {
@@ -486,7 +495,7 @@ static void pauseBleScanForWiFi() {
         return;
     }
 
-    BLEDevice::getScan()->stop();
+    NimBLEDevice::getScan()->stop();
     doScan = false;
     bleScanPausedForWiFi = true;
     Serial.println("BLE scan paused for WiFi");
@@ -716,7 +725,7 @@ static bool ensureWiFi() {
 
     if (!wifiConfigured) {
         WiFi.persistent(false);
-        WiFi.setSleep(bleRunning);
+        WiFi.setSleep(true);
         WiFi.mode(WIFI_STA);
         wifiConfigured = true;
     }
@@ -732,7 +741,7 @@ static bool ensureWiFi() {
     lastWiFiAttemptAt = millis();
     wifiConnectInProgress = true;
     pauseBleScanForWiFi();
-    WiFi.setSleep(bleRunning);
+    WiFi.setSleep(true);
     WiFi.mode(WIFI_STA);
     WiFi.disconnect(false, false);
     delay(150);
@@ -848,11 +857,16 @@ static void resetMeasurementContext() {
     expectedSampleCount = -1;
     measurementCompletePending = false;
     receivedDataCount = 0;
+    receivedDataOverflowLogged = false;
 }
 
 static bool addReceivedSample(float value) {
     if (receivedDataCount >= MAX_RECEIVED_SAMPLES) {
-        Serial.println("Received sample buffer full");
+        if (!receivedDataOverflowLogged) {
+            Serial.print("Received sample buffer full, max samples: ");
+            Serial.println(MAX_RECEIVED_SAMPLES);
+            receivedDataOverflowLogged = true;
+        }
         return false;
     }
 
@@ -867,7 +881,7 @@ static void applyStartField(const String& message, const String& key, String& ta
     }
 }
 
-static const SensorProfile* resolveSensorProfile(BLEAdvertisedDevice& advertisedDevice) {
+static const SensorProfile* resolveSensorProfile(const NimBLEAdvertisedDevice& advertisedDevice) {
     std::string name = advertisedDevice.getName();
     for (const SensorProfile& profile : sensorProfiles) {
         if (name == profile.name) {
@@ -882,7 +896,251 @@ static const SensorProfile* resolveSensorProfile(BLEAdvertisedDevice& advertised
     return nullptr;
 }
 
-static bool postJson(const String& path, const String& body, String* responseBody = nullptr) {
+static String extractJsonString(const String& json, const String& key) {
+    return jsonStringValue(json, key);
+}
+
+static bool parseServerEndpoint(char* host, size_t hostSize, uint16_t& port) {
+    String baseUrl(activeServerBaseUrl);
+    baseUrl.trim();
+
+    const String httpPrefix = "http://";
+    if (baseUrl.startsWith(httpPrefix)) {
+        baseUrl = baseUrl.substring(httpPrefix.length());
+    }
+
+    int slashIndex = baseUrl.indexOf('/');
+    if (slashIndex >= 0) {
+        baseUrl = baseUrl.substring(0, slashIndex);
+    }
+
+    int colonIndex = baseUrl.lastIndexOf(':');
+    port = 80;
+    String hostValue = baseUrl;
+
+    if (colonIndex > 0) {
+        hostValue = baseUrl.substring(0, colonIndex);
+        int parsedPort = baseUrl.substring(colonIndex + 1).toInt();
+        if (parsedPort > 0 && parsedPort <= 65535) {
+            port = (uint16_t)parsedPort;
+        }
+    }
+
+    hostValue.trim();
+    if (hostValue.length() == 0 || hostValue.length() >= hostSize) {
+        return false;
+    }
+
+    strlcpy(host, hostValue.c_str(), hostSize);
+    return true;
+}
+
+static bool readClientLine(WiFiClient& client, String& line) {
+    line = "";
+    unsigned long started = millis();
+
+    while ((long)(millis() - started) < HTTP_TIMEOUT_MS) {
+        while (client.available()) {
+            char c = (char)client.read();
+            if (c == '\n') {
+                line.trim();
+                return true;
+            }
+            line += c;
+        }
+
+        if (!client.connected() && !client.available()) {
+            return line.length() > 0;
+        }
+
+        delay(5);
+    }
+
+    line.trim();
+    return line.length() > 0;
+}
+
+static bool readExactBytes(WiFiClient& client, size_t count, String* responseBody) {
+    size_t readBytes = 0;
+    unsigned long started = millis();
+
+    while (readBytes < count && (long)(millis() - started) < HTTP_TIMEOUT_MS) {
+        while (client.available() && readBytes < count) {
+            char c = (char)client.read();
+            if (responseBody != nullptr) {
+                *responseBody += c;
+            }
+            readBytes++;
+            started = millis();
+        }
+
+        if (!client.connected() && !client.available()) {
+            break;
+        }
+
+        if (readBytes < count) {
+            delay(5);
+        }
+    }
+
+    return readBytes == count;
+}
+
+static bool discardExactBytes(WiFiClient& client, size_t count) {
+    return readExactBytes(client, count, nullptr);
+}
+
+static bool readChunkedBody(WiFiClient& client, String* responseBody) {
+    while (true) {
+        String sizeLine;
+        if (!readClientLine(client, sizeLine)) {
+            return false;
+        }
+
+        int extensionIndex = sizeLine.indexOf(';');
+        if (extensionIndex >= 0) {
+            sizeLine = sizeLine.substring(0, extensionIndex);
+        }
+        sizeLine.trim();
+
+        size_t chunkSize = strtoul(sizeLine.c_str(), nullptr, 16);
+        if (chunkSize == 0) {
+            String trailer;
+            do {
+                if (!readClientLine(client, trailer)) {
+                    return false;
+                }
+            } while (trailer.length() > 0);
+            return true;
+        }
+
+        if (!readExactBytes(client, chunkSize, responseBody)) {
+            return false;
+        }
+
+        if (!discardExactBytes(client, 2)) {
+            return false;
+        }
+    }
+}
+
+static bool readHttpResponse(WiFiClient& client, int& statusCode, String* responseBody) {
+    String statusLine;
+    if (!readClientLine(client, statusLine)) {
+        statusCode = -2;
+        return false;
+    }
+
+    int firstSpace = statusLine.indexOf(' ');
+    if (firstSpace >= 0 && firstSpace + 4 <= statusLine.length()) {
+        statusCode = statusLine.substring(firstSpace + 1, firstSpace + 4).toInt();
+    } else {
+        statusCode = -1;
+    }
+
+    int contentLength = 0;
+    bool chunked = false;
+    while (true) {
+        String header;
+        if (!readClientLine(client, header)) {
+            return false;
+        }
+
+        if (header.length() == 0) {
+            break;
+        }
+
+        String lowerHeader = header;
+        lowerHeader.toLowerCase();
+        if (lowerHeader.startsWith("content-length:")) {
+            String value = header.substring(header.indexOf(':') + 1);
+            value.trim();
+            contentLength = value.toInt();
+        } else if (lowerHeader.startsWith("transfer-encoding:") && lowerHeader.indexOf("chunked") >= 0) {
+            chunked = true;
+        }
+    }
+
+    if (responseBody != nullptr) {
+        responseBody->remove(0);
+        responseBody->reserve(contentLength > 0 ? contentLength + 8 : 128);
+    }
+
+    bool bodyRead = true;
+    if (chunked) {
+        bodyRead = readChunkedBody(client, responseBody);
+    } else if (contentLength > 0) {
+        bodyRead = readExactBytes(client, contentLength, responseBody);
+    }
+
+    return statusCode >= 200 && statusCode < 300 && bodyRead;
+}
+
+static bool writeAll(WiFiClient& client, const char* data, size_t length) {
+    size_t written = 0;
+    unsigned long started = millis();
+
+    while (written < length && (long)(millis() - started) < HTTP_TIMEOUT_MS) {
+        if (isReceiving) {
+            return false;
+        }
+
+        size_t chunk = client.write((const uint8_t*)data + written, length - written);
+        if (chunk > 0) {
+            written += chunk;
+            started = millis();
+            continue;
+        }
+
+        if (!client.connected()) {
+            return false;
+        }
+
+        delay(10);
+    }
+
+    return written == length;
+}
+
+static bool postJsonOnClient(WiFiClient& client, const char* host, uint16_t port, const String& path, const String& body, String* responseBody = nullptr) {
+    char url[SERVER_URL_MAX_LENGTH + 40];
+    snprintf(url, sizeof(url), "%s%s", activeServerBaseUrl, path.c_str());
+    Serial.print("HTTP POST ");
+    Serial.println(url);
+
+    String header;
+    header.reserve(180 + path.length());
+    header += "POST ";
+    header += path;
+    header += " HTTP/1.1\r\nHost: ";
+    header += host;
+    header += ":";
+    header += port;
+    header += "\r\nContent-Type: application/json\r\nContent-Length: ";
+    header += body.length();
+    header += "\r\nConnection: keep-alive\r\n\r\n";
+
+    if (!writeAll(client, header.c_str(), header.length()) || !writeAll(client, body.c_str(), body.length())) {
+        Serial.print("HTTP POST failed ");
+        Serial.print(path);
+        Serial.println(": write failed");
+        return false;
+    }
+
+    int code = -1;
+    bool ok = readHttpResponse(client, code, responseBody);
+    if (ok) {
+        return true;
+    }
+
+    Serial.print("HTTP POST failed ");
+    Serial.print(path);
+    Serial.print(": ");
+    Serial.println(code);
+    return false;
+}
+
+static bool openHttpSession(WiFiClient& client, char* host, size_t hostSize, uint16_t& port) {
     if (!ensureWiFi()) {
         return false;
     }
@@ -899,124 +1157,371 @@ static bool postJson(const String& path, const String& body, String* responseBod
         return false;
     }
 
-    HTTPClient http;
-    char url[SERVER_URL_MAX_LENGTH + 40];
-    snprintf(url, sizeof(url), "%s%s", activeServerBaseUrl, path.c_str());
-    Serial.print("HTTP POST ");
-    Serial.println(url);
-    http.setTimeout(HTTP_TIMEOUT_MS);
-    http.begin(url);
-    http.addHeader("Content-Type", "application/json");
-
-    int code = http.POST(body);
-    String response = http.getString();
-    http.end();
-
-    if (responseBody != nullptr) {
-        *responseBody = response;
+    if (!parseServerEndpoint(host, hostSize, port)) {
+        Serial.println("HTTP server URL parse failed");
+        return false;
     }
 
-    if (code >= 200 && code < 300) {
+    client.setTimeout(HTTP_TIMEOUT_MS / 1000);
+    if (!client.connect(host, port)) {
+        Serial.println("HTTP connect failed");
+        client.stop();
+        return false;
+    }
+
+    return true;
+}
+
+static bool postJson(const String& path, const String& body, String* responseBody = nullptr) {
+    WiFiClient client;
+    char host[64];
+    uint16_t port;
+    if (!openHttpSession(client, host, sizeof(host), port)) {
+        return false;
+    }
+
+    bool ok = postJsonOnClient(client, host, port, path, body, responseBody);
+    client.stop();
+    delay(30);
+    return ok;
+}
+
+static bool takeSdMutex(TickType_t timeoutTicks = pdMS_TO_TICKS(5000)) {
+    return sdMutex == nullptr || xSemaphoreTake(sdMutex, timeoutTicks) == pdTRUE;
+}
+
+static void giveSdMutex() {
+    if (sdMutex != nullptr) {
+        xSemaphoreGive(sdMutex);
+    }
+}
+
+static bool ensureQueueDir() {
+    if (!ensureSd()) {
+        return false;
+    }
+
+    if (SD.exists(QUEUE_DIR)) {
         return true;
     }
 
-    Serial.print("HTTP POST failed ");
-    Serial.print(path);
-    Serial.print(": ");
-    Serial.print(code);
-    Serial.print(" ");
-    if (code < 0) {
-        Serial.println(http.errorToString(code));
-    } else {
-        Serial.println(response);
+    if (SD.mkdir(QUEUE_DIR)) {
+        return true;
     }
+
+    Serial.println("SD queue directory create failed");
     return false;
 }
 
-static String extractJsonString(const String& json, const String& key) {
-    return jsonStringValue(json, key);
+static MeasurementMetadata currentMeasurementMetadata() {
+    MeasurementMetadata metadata;
+    metadata.deviceId = buildDeviceId();
+    metadata.sensorType = measurementSensorType;
+    metadata.unit = measurementUnit;
+    metadata.sampleRateHz = measurementSampleRateHz;
+    metadata.schemaVersion = measurementSchemaVersion;
+    metadata.bleAddress = activeBleAddress;
+    metadata.bleName = activeBleName;
+    metadata.sampleCount = receivedDataCount;
+    return metadata;
 }
 
-static void backupToSd(const MeasurementBatch& batch) {
+static void writeMetadataLine(File& file, const char* key, const String& value) {
+    file.print(key);
+    file.print("=");
+    file.println(value);
+}
+
+static bool enqueueQueuedFile(const PendingMeasurementRef& ref) {
+    if (measurementQueue == nullptr) {
+        return false;
+    }
+
+    return xQueueSend(measurementQueue, &ref, 0) == pdTRUE;
+}
+
+static bool writeMeasurementToSdQueue(const MeasurementMetadata& metadata, const float* samples, size_t sampleCount, PendingMeasurementRef* outRef) {
 #if SD_BACKUP_ENABLED
-    if (batch.samples.empty()) {
-        return;
+    if (sampleCount == 0) {
+        return false;
     }
 
-    uint32_t freeHeap = ESP.getFreeHeap();
-    if (freeHeap < SD_BACKUP_MIN_FREE_HEAP) {
-        Serial.print("SD backup skipped, free heap: ");
-        Serial.println(freeHeap);
-        return;
+    if (!takeSdMutex()) {
+        Serial.println("SD queue write skipped: mutex busy");
+        return false;
     }
 
-    if (!ensureSd()) {
-        return;
+    if (!ensureQueueDir()) {
+        giveSdMutex();
+        return false;
     }
 
-    File file = SD.open("/received_data.txt", FILE_WRITE);
+    char finalPath[QUEUE_PATH_MAX_LENGTH];
+    char tmpPath[QUEUE_PATH_MAX_LENGTH];
+    snprintf(finalPath, sizeof(finalPath), QUEUE_DIR "/m_%lu_%u.txt", millis(), (unsigned)sampleCount);
+    snprintf(tmpPath, sizeof(tmpPath), QUEUE_DIR "/m_%lu_%u.tmp", millis(), (unsigned)sampleCount);
+
+    File file = SD.open(tmpPath, FILE_WRITE);
     if (!file) {
-        Serial.println("SD backup open failed, retrying");
+        Serial.println("SD queue file open failed, retrying");
         SD.end();
         sdReady = false;
         delay(250);
-        if (!ensureSd()) {
-            return;
+        if (!ensureQueueDir()) {
+            giveSdMutex();
+            return false;
         }
 
-        file = SD.open("/received_data.txt", FILE_WRITE);
+        file = SD.open(tmpPath, FILE_WRITE);
         if (!file) {
-            Serial.println("SD backup open failed");
-            return;
+            Serial.println("SD queue file open failed");
+            giveSdMutex();
+            return false;
         }
     }
 
-    file.print("sensorType=");
-    file.println(batch.sensorType);
-    file.print("unit=");
-    file.println(batch.unit);
+    writeMetadataLine(file, "deviceId", metadata.deviceId);
+    writeMetadataLine(file, "sensorType", metadata.sensorType);
+    writeMetadataLine(file, "unit", metadata.unit);
     file.print("sampleRateHz=");
-    file.println(batch.sampleRateHz, 2);
+    file.println(metadata.sampleRateHz, 2);
     file.print("schemaVersion=");
-    file.println(batch.schemaVersion);
-    file.print("bleAddress=");
-    file.println(batch.bleAddress);
+    file.println(metadata.schemaVersion);
+    writeMetadataLine(file, "bleAddress", metadata.bleAddress);
+    writeMetadataLine(file, "bleName", metadata.bleName);
+    file.print("sampleCount=");
+    file.println((unsigned)sampleCount);
+    file.println("samples");
 
-    for (float value : batch.samples) {
-        file.println(value, 2);
+    for (size_t i = 0; i < sampleCount; i++) {
+        file.println(samples[i], 2);
     }
 
     file.close();
-    Serial.printf("SD backup saved: %u samples\n", batch.samples.size());
+
+    if (SD.exists(finalPath)) {
+        SD.remove(finalPath);
+    }
+
+    bool renamed = SD.rename(tmpPath, finalPath);
+    giveSdMutex();
+
+    if (!renamed) {
+        Serial.println("SD queue file rename failed");
+        return false;
+    }
+
+    strlcpy(outRef->path, finalPath, sizeof(outRef->path));
+    Serial.print("Measurement stored on SD: ");
+    Serial.print(finalPath);
+    Serial.print(" samples=");
+    Serial.println((unsigned)sampleCount);
+    return true;
 #else
-    (void)batch;
+    (void)metadata;
+    (void)samples;
+    (void)sampleCount;
+    (void)outRef;
+    return false;
 #endif
 }
 
-static String buildStartPayload(const MeasurementBatch& batch) {
+static void applyMetadataLine(MeasurementMetadata& metadata, const String& line) {
+    int separator = line.indexOf('=');
+    if (separator < 0) {
+        return;
+    }
+
+    String key = line.substring(0, separator);
+    String value = line.substring(separator + 1);
+    key.trim();
+    value.trim();
+
+    if (key == "deviceId") {
+        metadata.deviceId = value;
+    } else if (key == "sensorType") {
+        metadata.sensorType = value;
+    } else if (key == "unit") {
+        metadata.unit = value;
+    } else if (key == "sampleRateHz") {
+        metadata.sampleRateHz = value.toFloat();
+    } else if (key == "schemaVersion") {
+        metadata.schemaVersion = value.toInt();
+    } else if (key == "bleAddress") {
+        metadata.bleAddress = value;
+    } else if (key == "bleName") {
+        metadata.bleName = value;
+    } else if (key == "sampleCount") {
+        metadata.sampleCount = value.toInt();
+    }
+}
+
+static bool readMeasurementHeader(File& file, MeasurementMetadata& metadata) {
+    metadata = MeasurementMetadata();
+    metadata.sampleRateHz = 1.0f;
+    metadata.schemaVersion = 1;
+
+    while (file.available()) {
+        String line = file.readStringUntil('\n');
+        line.trim();
+        if (line == "samples") {
+            return metadata.sampleCount > 0;
+        }
+
+        applyMetadataLine(metadata, line);
+    }
+
+    return false;
+}
+
+static bool readMeasurementMetadataFromFile(const char* path, MeasurementMetadata& metadata) {
+    if (!takeSdMutex()) {
+        return false;
+    }
+
+    if (!ensureSd()) {
+        giveSdMutex();
+        return false;
+    }
+
+    File file = SD.open(path, FILE_READ);
+    if (!file) {
+        giveSdMutex();
+        Serial.print("Queued measurement open failed: ");
+        Serial.println(path);
+        return false;
+    }
+
+    bool ok = readMeasurementHeader(file, metadata);
+    file.close();
+    giveSdMutex();
+    return ok;
+}
+
+static bool readMeasurementChunkFromFile(const char* path, size_t startIndex, float* samples, size_t maxCount, size_t& actualCount) {
+    actualCount = 0;
+
+    if (!takeSdMutex()) {
+        return false;
+    }
+
+    if (!ensureSd()) {
+        giveSdMutex();
+        return false;
+    }
+
+    File file = SD.open(path, FILE_READ);
+    if (!file) {
+        giveSdMutex();
+        Serial.print("Queued measurement chunk open failed: ");
+        Serial.println(path);
+        return false;
+    }
+
+    MeasurementMetadata metadata;
+    if (!readMeasurementHeader(file, metadata)) {
+        file.close();
+        giveSdMutex();
+        return false;
+    }
+
+    size_t index = 0;
+    while (file.available() && actualCount < maxCount) {
+        String line = file.readStringUntil('\n');
+        line.trim();
+        if (line.length() == 0) {
+            continue;
+        }
+
+        if (index >= startIndex) {
+            samples[actualCount++] = line.toFloat();
+        }
+        index++;
+    }
+
+    file.close();
+    giveSdMutex();
+    return actualCount > 0;
+}
+
+static bool deleteQueuedMeasurement(const char* path) {
+    if (!takeSdMutex()) {
+        return false;
+    }
+
+    bool removed = ensureSd() && SD.remove(path);
+    giveSdMutex();
+
+    if (!removed) {
+        Serial.print("Queued measurement delete failed: ");
+        Serial.println(path);
+    }
+
+    return removed;
+}
+
+static bool findQueuedMeasurement(PendingMeasurementRef& ref) {
+    if (!takeSdMutex()) {
+        return false;
+    }
+
+    if (!ensureQueueDir()) {
+        giveSdMutex();
+        return false;
+    }
+
+    File root = SD.open(QUEUE_DIR);
+    if (!root) {
+        giveSdMutex();
+        return false;
+    }
+
+    File file = root.openNextFile();
+    while (file) {
+        String name = file.name();
+        bool directory = file.isDirectory();
+        file.close();
+
+        if (!directory && name.endsWith(".txt")) {
+            String path = name.startsWith("/") ? name : String(QUEUE_DIR) + "/" + name;
+            strlcpy(ref.path, path.c_str(), sizeof(ref.path));
+            root.close();
+            giveSdMutex();
+            return true;
+        }
+
+        file = root.openNextFile();
+    }
+
+    root.close();
+    giveSdMutex();
+    return false;
+}
+
+static String buildStartPayload(const MeasurementMetadata& metadata) {
     String payload;
     payload.reserve(384);
     payload += "{\"deviceId\":\"";
-    payload += jsonEscape(batch.deviceId);
+    payload += jsonEscape(metadata.deviceId);
     payload += "\",\"sensorType\":\"";
-    payload += jsonEscape(batch.sensorType);
+    payload += jsonEscape(metadata.sensorType);
     payload += "\",\"schemaVersion\":";
-    payload += batch.schemaVersion;
+    payload += metadata.schemaVersion;
     payload += ",\"sampleRateHz\":";
-    payload += String(batch.sampleRateHz, 2);
+    payload += String(metadata.sampleRateHz, 2);
     payload += ",\"unit\":\"";
-    payload += jsonEscape(batch.unit);
+    payload += jsonEscape(metadata.unit);
     payload += "\",\"meta\":{\"source\":\"esp32-hub\",\"hubId\":\"";
     payload += jsonEscape(String(HUB_ID));
     payload += "\",\"bleAddress\":\"";
-    payload += jsonEscape(batch.bleAddress);
+    payload += jsonEscape(metadata.bleAddress);
     payload += "\",\"bleName\":\"";
-    payload += jsonEscape(batch.bleName);
+    payload += jsonEscape(metadata.bleName);
     payload += "\"}}";
     return payload;
 }
 
-static String buildChunkPayload(const MeasurementBatch& batch, const String& measurementId, int chunkIndex, int totalChunks, int startIndex, int count) {
+static String buildChunkPayload(const String& measurementId, int chunkIndex, int totalChunks, const float* samples, int count) {
     String payload;
     payload.reserve(128 + count * 10);
     payload += "{\"measurementId\":\"";
@@ -1031,14 +1536,14 @@ static String buildChunkPayload(const MeasurementBatch& batch, const String& mea
         if (i > 0) {
             payload += ",";
         }
-        payload += String(batch.samples[startIndex + i], 2);
+        payload += String(samples[i], 2);
     }
 
     payload += "]}";
     return payload;
 }
 
-static String buildCompletePayload(const MeasurementBatch& batch, const String& measurementId, int totalChunks) {
+static String buildCompletePayload(const String& measurementId, int totalChunks, size_t sampleCount) {
     String payload;
     payload.reserve(128);
     payload += "{\"measurementId\":\"";
@@ -1046,62 +1551,122 @@ static String buildCompletePayload(const MeasurementBatch& batch, const String& 
     payload += "\",\"totalChunks\":";
     payload += totalChunks;
     payload += ",\"sampleCount\":";
-    payload += batch.samples.size();
+    payload += sampleCount;
     payload += "}";
     return payload;
 }
 
-static bool sendMeasurementToServer(const MeasurementBatch& batch) {
-    if (batch.samples.empty()) {
+static bool buildMeasurementUploadPayload(const char* path, const MeasurementMetadata& metadata, String& payload) {
+    if (!takeSdMutex()) {
+        return false;
+    }
+
+    if (!ensureSd()) {
+        giveSdMutex();
+        return false;
+    }
+
+    File file = SD.open(path, FILE_READ);
+    if (!file) {
+        giveSdMutex();
+        Serial.print("Queued measurement upload open failed: ");
+        Serial.println(path);
+        return false;
+    }
+
+    MeasurementMetadata fileMetadata;
+    if (!readMeasurementHeader(file, fileMetadata)) {
+        file.close();
+        giveSdMutex();
+        return false;
+    }
+
+    payload = "";
+    payload.reserve(512 + metadata.sampleCount * 8);
+    payload += "{\"deviceId\":\"";
+    payload += jsonEscape(metadata.deviceId);
+    payload += "\",\"sensorType\":\"";
+    payload += jsonEscape(metadata.sensorType);
+    payload += "\",\"schemaVersion\":";
+    payload += metadata.schemaVersion;
+    payload += ",\"sampleRateHz\":";
+    payload += String(metadata.sampleRateHz, 2);
+    payload += ",\"unit\":\"";
+    payload += jsonEscape(metadata.unit);
+    payload += "\",\"meta\":{\"source\":\"esp32-hub\",\"hubId\":\"";
+    payload += jsonEscape(String(HUB_ID));
+    payload += "\",\"bleAddress\":\"";
+    payload += jsonEscape(metadata.bleAddress);
+    payload += "\",\"bleName\":\"";
+    payload += jsonEscape(metadata.bleName);
+    payload += "\"},\"samples\":[";
+
+    size_t index = 0;
+    while (file.available()) {
+        String line = file.readStringUntil('\n');
+        line.trim();
+        if (line.length() == 0) {
+            continue;
+        }
+
+        if (index > 0) {
+            payload += ",";
+        }
+        payload += line;
+        index++;
+    }
+
+    file.close();
+    giveSdMutex();
+
+    payload += "]}";
+
+    if (index != metadata.sampleCount) {
+        Serial.print("Queued measurement sample count mismatch while building upload: ");
+        Serial.print(metadata.sampleCount);
+        Serial.print(" expected, ");
+        Serial.print(index);
+        Serial.println(" read");
+    }
+
+    return index > 0;
+}
+
+static bool sendMeasurementFileToServer(const char* path) {
+    MeasurementMetadata metadata;
+    if (!readMeasurementMetadataFromFile(path, metadata)) {
+        Serial.print("Queued measurement metadata read failed: ");
+        Serial.println(path);
+        return false;
+    }
+
+    if (metadata.sampleCount == 0) {
         Serial.println("No samples to send");
         return false;
     }
 
-    String startResponse;
-    if (!postJson("/api/ingest/start", buildStartPayload(batch), &startResponse)) {
+    String payload;
+    if (!buildMeasurementUploadPayload(path, metadata, payload)) {
+        Serial.println("Queued measurement upload payload build failed");
         return false;
     }
 
-    String measurementId = extractJsonString(startResponse, "measurementId");
+    String response;
+    if (!postJson("/api/ingest/measurement", payload, &response)) {
+        return false;
+    }
+
+    String measurementId = extractJsonString(response, "measurementId");
     if (measurementId.length() == 0) {
         Serial.println("MeasurementId not found in server response");
-        return false;
-    }
-
-    int totalChunks = (batch.samples.size() + CHUNK_SIZE - 1) / CHUNK_SIZE;
-    for (int chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
-        int startIndex = chunkIndex * CHUNK_SIZE;
-        int count = min((int)CHUNK_SIZE, (int)batch.samples.size() - startIndex);
-        String chunkPayload = buildChunkPayload(batch, measurementId, chunkIndex, totalChunks, startIndex, count);
-
-        if (!postJson("/api/ingest/chunk", chunkPayload)) {
-            return false;
-        }
-    }
-
-    if (!postJson("/api/ingest/complete", buildCompletePayload(batch, measurementId, totalChunks))) {
+        Serial.print("Start response: ");
+        Serial.println(response);
         return false;
     }
 
     Serial.print("Measurement sent: ");
     Serial.println(measurementId);
     return true;
-}
-
-static MeasurementBatch* createMeasurementBatch() {
-    auto* batch = new MeasurementBatch();
-    batch->deviceId = buildDeviceId();
-    batch->sensorType = measurementSensorType;
-    batch->unit = measurementUnit;
-    batch->sampleRateHz = measurementSampleRateHz;
-    batch->schemaVersion = measurementSchemaVersion;
-    batch->bleAddress = activeBleAddress;
-    batch->bleName = activeBleName;
-    batch->samples.reserve(receivedDataCount);
-    for (size_t i = 0; i < receivedDataCount; i++) {
-        batch->samples.push_back(receivedData[i]);
-    }
-    return batch;
 }
 
 static void enqueueCompletedMeasurement() {
@@ -1112,17 +1677,16 @@ static void enqueueCompletedMeasurement() {
         return;
     }
 
-    MeasurementBatch* batch = createMeasurementBatch();
-
-    if (measurementQueue == nullptr || xQueueSend(measurementQueue, &batch, 0) != pdTRUE) {
-        Serial.println("Measurement queue full, upload skipped");
-        backupToSd(*batch);
-        delete batch;
+    MeasurementMetadata metadata = currentMeasurementMetadata();
+    PendingMeasurementRef ref = {};
+    if (!writeMeasurementToSdQueue(metadata, receivedData, receivedDataCount, &ref)) {
+        Serial.println("Measurement SD queue write failed");
     } else {
         Serial.print("Measurement queued: ");
-        Serial.print(batch->samples.size());
-        Serial.println(" samples");
-        backupToSd(*batch);
+        Serial.println(ref.path);
+        if (!enqueueQueuedFile(ref)) {
+            Serial.println("Measurement RAM queue full, SD file retained");
+        }
     }
 
     receivedDataCount = 0;
@@ -1137,7 +1701,7 @@ static void finishMeasurement() {
 
 static void disconnectBleSensor() {
     if (pClient != nullptr && pClient->isConnected()) {
-        Serial.println("Disconnecting BLE before WiFi upload");
+        Serial.println("Disconnecting BLE sensor");
         pClient->disconnect();
         delay(500);
     }
@@ -1320,7 +1884,9 @@ static bool handleH1DataBytes(const uint8_t* data, size_t length) {
     return true;
 }
 
-static void notifyCallback(BLERemoteCharacteristic* pBLERemoteCharacteristic, uint8_t* pData, size_t length, bool isNotify) {
+static void notifyCallback(NimBLERemoteCharacteristic* pBLERemoteCharacteristic, uint8_t* pData, size_t length, bool isNotify) {
+    lastBleActivityAt = millis();
+
     if (handleH1DataBytes(pData, length)) {
         return;
     }
@@ -1382,13 +1948,13 @@ static void notifyCallback(BLERemoteCharacteristic* pBLERemoteCharacteristic, ui
     }
 }
 
-class MyClientCallback : public BLEClientCallbacks {
-    void onConnect(BLEClient* pclient) {
+class MyClientCallback : public NimBLEClientCallbacks {
+    void onConnect(NimBLEClient* pclient) {
         connected = true;
         doScan = false;
     }
 
-    void onDisconnect(BLEClient* pclient) {
+    void onDisconnect(NimBLEClient* pclient) {
         connected = false;
         if (!provisioningMode) {
             doScan = true;
@@ -1409,7 +1975,7 @@ static bool connectToSensor() {
     Serial.print("Connecting to BLE sensor ");
     Serial.println(activeBleAddress);
 
-    pClient = BLEDevice::createClient();
+    pClient = NimBLEDevice::createClient();
     pClient->setClientCallbacks(new MyClientCallback());
 
     if (!pClient->connect(myDevice)) {
@@ -1418,7 +1984,7 @@ static bool connectToSensor() {
         return false;
     }
 
-    BLERemoteService* pRemoteService = pClient->getService(serviceUUID);
+    NimBLERemoteService* pRemoteService = pClient->getService(serviceUUID);
     if (pRemoteService == nullptr) {
         Serial.println("BLE service not found");
         pClient->disconnect();
@@ -1435,7 +2001,7 @@ static bool connectToSensor() {
     }
 
     if (pRemoteCharacteristic->canNotify()) {
-        pRemoteCharacteristic->registerForNotify(notifyCallback);
+        pRemoteCharacteristic->subscribe(true, notifyCallback);
     }
 
     connected = true;
@@ -1443,19 +2009,19 @@ static bool connectToSensor() {
     return true;
 }
 
-class MyAdvertisedDeviceCallbacks : public BLEAdvertisedDeviceCallbacks {
-    void onResult(BLEAdvertisedDevice advertisedDevice) {
+class MyAdvertisedDeviceCallbacks : public NimBLEScanCallbacks {
+    void onResult(const NimBLEAdvertisedDevice* advertisedDevice) {
         Serial.print("BLE advertised device: ");
-        Serial.println(advertisedDevice.toString().c_str());
+        Serial.println(advertisedDevice->toString().c_str());
 
-        const SensorProfile* profile = resolveSensorProfile(advertisedDevice);
+        const SensorProfile* profile = resolveSensorProfile(*advertisedDevice);
         if (profile == nullptr) {
             return;
         }
 
         activeProfile = *profile;
-        BLEDevice::getScan()->stop();
-        myDevice = new BLEAdvertisedDevice(advertisedDevice);
+        NimBLEDevice::getScan()->stop();
+        myDevice = new NimBLEAdvertisedDevice(*advertisedDevice);
         doConnect = true;
         doScan = true;
     }
@@ -1467,9 +2033,9 @@ static void startBle() {
     }
 
     stopDisconnectedWiFiRadio();
-    BLEDevice::init("");
-    BLEScan* pBLEScan = BLEDevice::getScan();
-    pBLEScan->setAdvertisedDeviceCallbacks(new MyAdvertisedDeviceCallbacks());
+    NimBLEDevice::init("");
+    NimBLEScan* pBLEScan = NimBLEDevice::getScan();
+    pBLEScan->setScanCallbacks(new MyAdvertisedDeviceCallbacks());
     pBLEScan->setInterval(1349);
     pBLEScan->setWindow(449);
     pBLEScan->setActiveScan(true);
@@ -1484,10 +2050,10 @@ static void stopBle() {
     }
 
     disconnectBleSensor();
-    BLEDevice::getScan()->stop();
-    BLEDevice::deinit(false);
+    NimBLEDevice::getScan()->stop();
+    NimBLEDevice::deinit(false);
     if (pClient != nullptr) {
-        delete pClient;
+        NimBLEDevice::deleteClient(pClient);
     }
     if (myDevice != nullptr) {
         delete myDevice;
@@ -1516,47 +2082,21 @@ static bool readyForUpload() {
     return WiFi.status() == WL_CONNECTED && activeServerBaseUrl[0] != '\0';
 }
 
-static void closeWiFiUploadWindow() {
-    stopWiFi();
-    lastWiFiAttemptAt = 0;
-    nextUploadRetryAt = millis() + WIFI_RETRY_DELAY_MS;
-}
-
-static bool releaseBleForUploadIfNeeded(bool forceRelease) {
-    if (!bleRunning || isReceiving || measurementCompletePending || bleConnectInProgress) {
+static bool readyForHttpUploadWindow() {
+    if (bleBusy()) {
         return false;
     }
 
-    uint32_t freeHeap = ESP.getFreeHeap();
-    if (!forceRelease && freeHeap >= HTTP_UPLOAD_MIN_FREE_HEAP) {
+    if (lastBleActivityAt > 0 && (long)(millis() - lastBleActivityAt) < BLE_UPLOAD_QUIET_MS) {
         return false;
     }
 
-    Serial.print("Releasing BLE for HTTP upload, free heap: ");
-    Serial.println(freeHeap);
-    wifiConnectInProgress = true;
-    stopBle();
-    delay(700);
-    Serial.print("Heap after BLE release: ");
-    Serial.println(ESP.getFreeHeap());
     return true;
 }
 
-static void restoreBleAfterUpload(bool releasedBle) {
-    if (!releasedBle || provisioningMode) {
-        wifiConnectInProgress = false;
-        return;
-    }
-
-    closeWiFiUploadWindow();
-    startBle();
-    wifiConnectInProgress = false;
-    Serial.print("Heap after BLE restart: ");
-    Serial.println(ESP.getFreeHeap());
-}
-
 static void networkTask(void* parameter) {
-    MeasurementBatch* pendingBatch = nullptr;
+    PendingMeasurementRef pendingMeasurement = {};
+    bool hasPendingMeasurement = false;
     bool waitingForConnectivity = false;
 
     while (true) {
@@ -1565,11 +2105,24 @@ static void networkTask(void* parameter) {
             continue;
         }
 
-        if (pendingBatch == nullptr && measurementQueue != nullptr) {
-            xQueueReceive(measurementQueue, &pendingBatch, pdMS_TO_TICKS(1000));
+        if (!hasPendingMeasurement && measurementQueue != nullptr) {
+            hasPendingMeasurement = xQueueReceive(measurementQueue, &pendingMeasurement, pdMS_TO_TICKS(1000)) == pdTRUE;
         }
 
-        if (pendingBatch != nullptr) {
+        if (!hasPendingMeasurement) {
+            hasPendingMeasurement = findQueuedMeasurement(pendingMeasurement);
+        }
+
+        if (!hasPendingMeasurement) {
+            if (!readyForUpload()) {
+                ensureWiFi();
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(1000));
+            continue;
+        }
+
+        if (hasPendingMeasurement) {
             if (waitingForConnectivity && readyForUpload() && nextUploadRetryAt != 0) {
                 nextUploadRetryAt = 0;
                 waitingForConnectivity = false;
@@ -1577,19 +2130,12 @@ static void networkTask(void* parameter) {
             }
 
             if (nextUploadRetryAt == 0 || (long)(millis() - nextUploadRetryAt) >= 0) {
-                while (bleBusy()) {
-                    vTaskDelay(pdMS_TO_TICKS(200));
-                }
-
-                bool releasedBle = releaseBleForUploadIfNeeded(true);
-
                 if (!readyForUpload()) {
                     Serial.println("Connecting WiFi for queued measurement");
                     ensureWiFi();
                 }
 
                 if (!readyForUpload()) {
-                    restoreBleAfterUpload(releasedBle);
                     Serial.println("Measurement upload deferred: WiFi/server unavailable");
                     waitingForConnectivity = true;
                     nextUploadRetryAt = millis() + WIFI_RETRY_DELAY_MS;
@@ -1598,14 +2144,18 @@ static void networkTask(void* parameter) {
                     continue;
                 }
 
+                if (!readyForHttpUploadWindow()) {
+                    vTaskDelay(pdMS_TO_TICKS(200));
+                    continue;
+                }
+
                 bool uploaded = false;
                 if (ESP.getFreeHeap() < HTTP_UPLOAD_MIN_FREE_HEAP) {
                     Serial.print("Measurement upload deferred: low heap ");
                     Serial.println(ESP.getFreeHeap());
                 } else {
-                    uploaded = sendMeasurementToServer(*pendingBatch);
+                    uploaded = sendMeasurementFileToServer(pendingMeasurement.path);
                 }
-                restoreBleAfterUpload(releasedBle);
 
                 if (!uploaded) {
                     Serial.println("Measurement upload failed");
@@ -1615,9 +2165,10 @@ static void networkTask(void* parameter) {
                     Serial.print("Measurement retry in ms: ");
                     Serial.println(WIFI_RETRY_DELAY_MS);
                 } else {
-                    delete pendingBatch;
-                    pendingBatch = nullptr;
-                    nextUploadRetryAt = millis() + WIFI_RETRY_DELAY_MS;
+                    deleteQueuedMeasurement(pendingMeasurement.path);
+                    pendingMeasurement = {};
+                    hasPendingMeasurement = false;
+                    nextUploadRetryAt = 0;
                     waitingForConnectivity = false;
                 }
             }
@@ -1639,14 +2190,20 @@ void setup() {
     Serial.begin(115200);
     delay(1000);
 
-    measurementQueue = xQueueCreate(8, sizeof(MeasurementBatch*));
+    measurementQueue = xQueueCreate(16, sizeof(PendingMeasurementRef));
     if (measurementQueue == nullptr) {
         Serial.println("Measurement queue create failed");
+    }
+
+    sdMutex = xSemaphoreCreateMutex();
+    if (sdMutex == nullptr) {
+        Serial.println("SD mutex create failed");
     }
 
     sdReady = SD.begin(SD_CS_PIN);
     if (sdReady) {
         Serial.println("SD ready");
+        ensureQueueDir();
     } else {
         Serial.println("SD unavailable");
     }
@@ -1678,7 +2235,7 @@ void loop() {
 
     handleRuntimeProvisioningButton();
 
-    if (doConnect && !wifiConnectInProgress) {
+    if (doConnect) {
         if (connectToSensor()) {
             Serial.println("BLE sensor connected");
         } else {
@@ -1687,8 +2244,8 @@ void loop() {
         doConnect = false;
     }
 
-    if (!connected && doScan && !wifiConnectInProgress) {
-        BLEDevice::getScan()->start(5, false);
+    if (!connected && doScan) {
+        NimBLEDevice::getScan()->start(5, false);
     }
 
     if (measurementCompletePending) {
